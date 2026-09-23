@@ -195,6 +195,21 @@ export interface MatrixCellCoord {
 // The full matrix-cells payload: bounds, precision, vocabulary lists
 // (matrix_summary ordering: declared first, observed strays after),
 // has_on, and every cell as coordinates without a byte of Pronto.
+/** One extras lattice, as the browse payload ships it
+ * (extras-in-the-matrix-card.md 6). ``key`` is the source file's own
+ * word for it, verbatim, and the three vocabulary lists are the
+ * lattice's OWN: an extra is usually narrower than the main one, so a
+ * browser reading its axes off the matrix would offer values that do
+ * not exist. */
+export interface MatrixLattice {
+    axis: string;
+    key: string;
+    modes: string[];
+    fan_modes: string[];
+    swing_modes: string[];
+    cells: MatrixCellCoord[];
+}
+
 export interface MatrixCells {
     min_temp: number;
     max_temp: number;
@@ -208,6 +223,9 @@ export interface MatrixCells {
     swing_modes: string[];
     has_on: boolean;
     cells: MatrixCellCoord[];
+    // Absent entirely on a matrix with no extras, which is every
+    // payload this client saw before hair-wig/4 existed.
+    lattices?: MatrixLattice[];
 }
 
 // Combined linked-count entry (signpost 3, Track 2 item 0.1 / Track 3
@@ -504,6 +522,12 @@ export interface SavePlanRow {
     comb_suspect?: boolean;
     /** The comb's finding for this row, tooltip material only. */
     comb_finding?: string | null;
+    /** Which extras lattice a checklist row samples. Absent on every
+     * other row, which is every row of a wig without extras, so such a
+     * plan reads exactly as it always did. TEST must carry both, or it
+     * sends the main lattice's code at the same coordinates. */
+    axis?: string | null;
+    lattice?: string | null;
 }
 
 /** A wig row nothing on the device covers. Second Fitting amendment v2
@@ -801,6 +825,13 @@ export interface LastHeard {
     fan: string | null;
     swing: string | null;
     temp: number | null;
+    // Which lattice the heard state belongs to, null for the main one
+    // and for a power code. The backend has sent both since the
+    // listener learned extras; declaring them is what lets door 1's
+    // + Trigger forward them rather than drop them. Optional, because
+    // a row persisted before then carries neither.
+    axis?: string | null;
+    lattice?: string | null;
     at: string;
     sl_pattern: string | null;
     receiver_entity_id: string | null;
