@@ -1,0 +1,33 @@
+{
+ "protocol": "PANASONIC216",
+ "how_to_read": "Each entry names one coordinate of the .defects.json lattice that was deliberately corrupted. Every other coordinate is byte-identical to the clean pack.",
+ "defects": [
+  {
+   "defect": "temperature_wrong_value",
+   "field": "temperature",
+   "mode": "cool",
+   "fan": "auto",
+   "swing": null,
+   "temp": 16.0,
+   "note": "temperature field forced to 0x01 (map says 0x00); integrity recomputed so only the field check can catch it"
+  },
+  {
+   "defect": "mode_wrong_value",
+   "field": "mode",
+   "mode": "cool",
+   "fan": "auto",
+   "swing": null,
+   "temp": 18.0,
+   "note": "mode field forced to 0x04 (map says 0x03); integrity recomputed so only the field check can catch it"
+  },
+  {
+   "defect": "checksum_broken",
+   "field": null,
+   "mode": "cool",
+   "fan": "auto",
+   "swing": null,
+   "temp": 20.0,
+   "note": "checksum byte incremented; only the integrity check sees it"
+  }
+ ]
+}

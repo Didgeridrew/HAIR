@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -709,11 +710,34 @@ class SignalStore:
             self._dismissed.discard(device.fingerprint)
         self.rebuild_signal_index()
 
+    async def async_flush(self) -> bool:
+        """Write a dirty store NOW, and cancel the pending timers.
+
+        THE LAST-CHANCE WRITE (WigFactory bench 2026-09-23). Every
+        capture only calls ``schedule_save``, which arms a
+        ``SIGNAL_SAVE_DEBOUNCE_S`` debounce under a
+        ``SIGNAL_SAVE_MAX_DELAY_S`` ceiling, so at any moment the
+        catalog on disk can be up to thirty seconds behind the
+        catalog in memory. Something has to close that window when
+        the loop is about to go away, and this is that something.
+
+        Returns whether anything was written, so a caller can say so.
+        A clean store writes nothing: the debounce may well have
+        fired a second ago, and a shutdown is no reason to rewrite a
+        file that already matches.
+
+        Both shutdown paths come through here and neither may assume
+        it is the only one. It is idempotent by the dirty flag.
+        """
+        self._cancel_timers()
+        if not self._dirty:
+            return False
+        await self.async_save()
+        return True
+
     async def async_shutdown(self) -> None:
         """Flush pending writes and cancel timers."""
-        self._cancel_timers()
-        if self._dirty:
-            await self.async_save()
+        await self.async_flush()
 
 
 # ---------------------------------------------------------------------------
@@ -995,8 +1019,11 @@ def _heal_device_signals(device: UnknownDevice) -> bool:
     under the pre-unified runtime dedup. Signals collapse under the
     tiered identity rule (decoded > byte_hash > S/L fingerprint),
     merging each duplicate's hit count into the first (older)
-    occurrence and keeping that row's alias (adopting the duplicate's
-    alias only when the kept row has none). Two signals that share an
+    occurrence. The kept row keeps its alias, and a duplicate's alias
+    is never dropped: every name the kept row lacks is joined onto it
+    with " / ", each name once, past a length cap counted rather than
+    shown (``_alias_names``, ``_render_alias``), so a name the owner gave
+    stays visible and a rename undoes the join. Two signals that share an
     S/L fingerprint but differ at the byte level (Panasonic, TCL, Sony
     siblings) are distinct and are NOT collapsed.
 
@@ -1038,6 +1065,10 @@ def _heal_device_signals(device: UnknownDevice) -> bool:
     fp_nod: dict[str, UnknownSignal] = {}  # rows lacking decoded
     fp_nob: dict[str, UnknownSignal] = {}  # rows lacking byte_hash
     fp_nodb: dict[str, UnknownSignal] = {}  # rows lacking both
+    # Per kept row that absorbed a duplicate: its names in order and the
+    # count of names a cap already hid, rendered once at the end so a
+    # name the cap hides is counted once however many rows carry it.
+    joined: dict[int, tuple[UnknownSignal, list[str], list[int]]] = {}
 
     for sig in device.signals:
         dec = sig.decoded_fingerprint
@@ -1068,8 +1099,13 @@ def _heal_device_signals(device: UnknownDevice) -> bool:
 
         if best is not None:
             best.hit_count += sig.hit_count
-            if not best.alias and sig.alias:
-                best.alias = sig.alias
+            if id(best) not in joined:
+                names, hidden = _alias_names(best.alias)
+                joined[id(best)] = (best, names, [hidden])
+            _row, names, hidden_box = joined[id(best)]
+            more, hidden = _alias_names(sig.alias)
+            names.extend(name for name in more if name not in names)
+            hidden_box[0] += hidden
             if sig.last_seen and (
                 not best.last_seen or sig.last_seen > best.last_seen
             ):
@@ -1100,10 +1136,53 @@ def _heal_device_signals(device: UnknownDevice) -> bool:
                 if not dec:
                     fp_nodb.setdefault(fp, sig)
 
+    for row, names, hidden_box in joined.values():
+        row.alias = _render_alias(names, hidden_box[0])
     if len(kept) != len(device.signals):
         device.signals = kept
         return True
     return False
+
+
+#: Past this many characters a joined alias counts its remaining names
+#: instead of showing them. A first name is always shown whole.
+_ALIAS_LIMIT = 120
+_ALIAS_MORE = re.compile(r"^\.\.\. (\d+) more$")
+
+
+def _alias_names(alias: str) -> tuple[list[str], int]:
+    """The names in one alias, each once and in order, and the count a
+    previous join's cap already hid ("... 3 more").
+
+    WHY JOIN AT ALL. A load-time re-key can make rows the owner named
+    apart one identity: when a family joins the read-bytes list, every
+    press of one setting (the whole press, its lone frames, a later
+    press with another clock byte) is one signal, and the heal collapses
+    them into the oldest. Keeping only that row's alias would delete
+    names the owner chose. The model holds one alias per row, so the
+    others are joined onto it."""
+    names: list[str] = []
+    hidden = 0
+    for part in alias.split(" / "):
+        part = part.strip()
+        more = _ALIAS_MORE.match(part)
+        if more:
+            hidden += int(more.group(1))
+        elif part and part not in names:
+            names.append(part)
+    return names, hidden
+
+
+def _render_alias(names: list[str], hidden: int) -> str:
+    """Names joined with " / " up to ``_ALIAS_LIMIT`` characters, then
+    " / ... N more" for the rest."""
+    shown: list[str] = []
+    for name in names:
+        if shown and len(" / ".join([*shown, name])) > _ALIAS_LIMIT:
+            break
+        shown.append(name)
+    hidden += len(names) - len(shown)
+    return " / ".join([*shown, f"... {hidden} more"] if hidden else shown)
 
 
 # ---------------------------------------------------------------------------

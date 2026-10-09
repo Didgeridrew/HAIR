@@ -63,6 +63,23 @@ class SignalIdentity:
     decoded_fingerprint: str | None = None
     byte_hash: str | None = None
     fingerprint: str = ""
+    #: Did the decode explain the WHOLE capture? False means it did
+    #: not, and then the decoded fingerprint is not this record's
+    #: identity: every DAIKIN216 code reads as the same
+    #: ``KASEIKYO64:0xda11:0x20f000000002`` because the decoder only
+    #: ever reads the constant frame 0. None is TRUSTED, matching
+    #: ``protocol_decode``'s own rule that an unverifiable census is
+    #: unknown rather than false -- the upstream strict NEC path
+    #: reports None for every capture and must not be demoted by it.
+    #: Default None so every existing construction site stays valid.
+    decode_covers: bool | None = None
+
+    @property
+    def _usable_decoded(self) -> str | None:
+        """The decoded fingerprint, unless the decode did not cover."""
+        if self.decode_covers is False:
+            return None
+        return self.decoded_fingerprint
 
     def match_tier(self, other: SignalIdentity) -> int | None:
         """Return the tier this pair matches at, or None for no match.
@@ -70,9 +87,19 @@ class SignalIdentity:
         The highest tier BOTH sides carry decides; a decided-tier
         mismatch is final (no fallthrough), a tier either side lacks is
         skipped. Empty fingerprints never match at tier 3.
+
+        A NON-COVERING DECODE IS NOT A TIER (owner ruling 2026-09-29).
+        A record whose ``decode_covers`` is False has no usable decoded
+        identity, so this falls to the byte hash -- which, for an
+        allowlisted family, is now computed on the setting frames and
+        therefore separates the states. Without this the byte hash is
+        never reached: every Daikin press carries the same frame-0
+        decoded fingerprint and matched every Daikin trigger.
         """
-        if self.decoded_fingerprint and other.decoded_fingerprint:
-            if self.decoded_fingerprint == other.decoded_fingerprint:
+        mine = self._usable_decoded
+        theirs = other._usable_decoded
+        if mine and theirs:
+            if mine == theirs:
                 return TIER_DECODED
             return None
         if self.byte_hash and other.byte_hash:
@@ -99,8 +126,8 @@ class SignalIdentity:
         actually carry that layer, which holds for keys derived from
         the same code path.
         """
-        if self.decoded_fingerprint:
-            return (TIER_DECODED, self.decoded_fingerprint)
+        if self._usable_decoded:
+            return (TIER_DECODED, self._usable_decoded)
         if self.byte_hash:
             return (TIER_BYTE_HASH, self.byte_hash)
         return (TIER_FINGERPRINT, self.fingerprint)
@@ -491,6 +518,903 @@ def _level_labels(values: list[float]) -> list[int]:
     return labels
 
 
+# ---------------------------------------------------------------------------
+# SETTING-FRAME IDENTITY (owner rulings 2026-09-28 and 2026-09-29)
+# ---------------------------------------------------------------------------
+#
+# An AC handset spreads one press over several frames, and only some of
+# them carry the settings. Identity computed on the FIRST frame reads
+# the same for every state the unit can be in, which is what made a
+# matrix remote hear Off for every Daikin press (#178 stopped it
+# answering; this makes it answer correctly). Identity computed on the
+# SETTING frames separates the states.
+#
+# WHICH FRAMES: the map says, in ``setting_frames``, since schema v0.5.
+# They are concatenated in the order the map lists them, which puts
+# ``payload_frame`` first and is the map's own statement of which block
+# is primary. Order only has to be agreed, and taking it from one place
+# is what agrees it.
+#
+# WHY AN ALLOWLIST AS WELL. A map naming its setting frames is a claim,
+# and the claim is checkable: read every code in the family's own
+# ``derivation.files_used`` and ask whether one setting-frame identity
+# ever covers two cells whose frames do not all decode alike. Measured
+# 2026-09-29, counting only collisions this change would INTRODUCE
+# (cells already sharing every frame are one waveform today and resolve
+# as one now):
+#
+#   DAIKIN216     setting_frames [1]     1 source  (the FTXS50KVM wig)   0
+#   PANASONIC216  setting_frames [1]     11 files                        0
+#   TCL112        setting_frames [1, 0]  14 files                        0
+#   DAIKIN152     setting_frames [3]     8 files                        14
+#   MITSUBISHI144 setting_frames [0]     19 files (2026-10-02)          0
+#
+# TCL112 is the case the key was added for: on ``payload_frame`` alone
+# it had 692 colliding identities, because its fan speed rides in frame
+# 0, and naming both frames takes it to zero.
+#
+# DAIKIN152's fourteen are all in one file, smartHomeHub codeset 1108,
+# and they are that file mislabelling rather than the map misreading.
+# They are cool/level5/T against heat/level5/T for T = 18 through 31,
+# a whole contiguous temperature run at one fan level, and the ONLY
+# bytes that differ anywhere in the four frames are frame 2 bytes 5
+# and 7, which are the capture-time clock. Two captures of one press,
+# filed under two modes. The owner ruled the target is zero collisions
+# between cells that differ in something the unit ACTS ON; by that
+# measure this file contributes zero and the family is on the list.
+#
+# GREE is NOT on the list. Its map declares setting_frames [0, 1], but
+# its derivation names no file list to check it against ("25 distinct
+# files with the (35,32) layout"), so the claim is unverified here.
+# Unverified is off.
+#
+# The set lives here rather than in the map YAML on purpose (owner
+# ruling 2026-09-28): the maps are the field-map author's format, and
+# once they record which families are verified this constant moves into
+# them.
+SETTING_IDENTITY_VERIFIED = frozenset({
+    "DAIKIN216", "PANASONIC216", "TCL112", "DAIKIN152", "MITSUBISHI144",
+})
+
+
+def setting_identity_families() -> tuple[str, ...]:
+    """The allowlist, sorted, for the stored index's digest."""
+    return tuple(sorted(SETTING_IDENTITY_VERIFIED))
+
+
+# ---------------------------------------------------------------------------
+# IDENTITY FROM THE BYTES THE MAP READS (GH #183, 2026-09-30)
+# ---------------------------------------------------------------------------
+#
+# Setting-frame identity hashes the settings frame's TIMINGS. Two things
+# a real handset does defeat that, and both were measured:
+#
+# - The air moves every edge. Research doc 22: twenty presses of one AC
+#   state through a microsecond-accurate transmitter gave twenty byte
+#   hashes, none the file's, because a receiver brings marks back short
+#   and spaces long (marks 0.83-0.95, spaces 1.00-1.12, single edges
+#   0.71-1.27) and a 300-edge frame always has some edge on a bin line.
+# - The handset writes bytes the file did not. The #183 reporter's
+#   capture reads as the state his wig holds, and its settings frame
+#   still differs from that cell in bytes 5, 11, 12 and 15: timer and
+#   clock bits nothing reads.
+#
+# So for a family on the list below, the byte hash is instead a hash of
+# what the map READS: the protocol id, its declared identity bytes, and
+# every field's raw bits in map order. Provisional fields take part
+# exactly like ratified ones (owner ruling 2026-09-30: confidence gates
+# comb findings, never identity). Bits no field names do not take part,
+# and the frame's own checksum never does -- it is recomputed and must
+# hold before any key is formed, so a bit the air flipped is refused
+# rather than heard as a different state.
+#
+# WHY A SECOND LIST. The key is only as distinct as the map: a family
+# whose file varies a setting the map does not read (a swing the map
+# has no field for, a turbo flag beside the fan nibble) would collapse
+# two states onto one key. Completeness is a fact about a family's
+# files, not something a map can say about itself, so a family joins
+# only when the distinctness sweep over its own derivation sources is
+# clean, and ``test_read_bytes_identity``'s sweep over its field pack
+# keeps it honest. Measured on each family's own sources:
+#
+#   DAIKIN216     FTXS50KVM wig        520 states, 520 keys      clean
+#   DAIKIN152     8 files + the #183   no two labels share a key but
+#                 wig (2026-09-30, on  where the file itself stores
+#                 e867038's map)       one code under several labels
+#                                      (dry and fan_only ignore the
+#                                      temperature), and 1108's known
+#                                      cool/heat mislabel         in
+#   MITSUBISHI144 19 files (2026-10-02, no two labels share a key but
+#                 on the measurement   where the file stores one code
+#                 pass's map)          under several labels (dry,
+#                                      fan_only and ifeel ignore the
+#                                      temperature), 8 single readings
+#                                      filed under two labels, and two
+#                                      1129 codes that differ only in
+#                                      byte 9 bits 6-7            in
+#   PANASONIC216  11 files             swing unmapped (1030), quiet
+#                                      beside fan (1032)         out
+#   TCL112        14 files             turbo beside fan, Fahrenheit
+#                                      and half-degree labels    out
+#
+# PANASONIC216 and TCL112 keep setting-frame identity until their maps
+# grow.
+READ_BYTES_VERIFIED = frozenset({"DAIKIN216", "DAIKIN152", "MITSUBISHI144"})
+
+
+def read_bytes_families() -> tuple[str, ...]:
+    """The read-bytes list, sorted, for the stored index's digest."""
+    return tuple(sorted(READ_BYTES_VERIFIED))
+
+
+def _stripped(timings: list[int] | None) -> list[int]:
+    """The train ``field_readers`` walks: trailing Pronto zeros removed."""
+    train = [int(v) for v in (timings or [])]
+    while train and train[-1] == 0:
+        train.pop()
+    return train
+
+
+def _verified_reading(train: list[int]):
+    """``(map, places)`` for an allowlisted family, or None.
+
+    One place decides both whether the setting-frame path applies and
+    where its frames sit, so the two can never disagree.
+    """
+    got = _verified_decoding(train, SETTING_IDENTITY_VERIFIED)
+    return None if got is None else (got[0], got[1])
+
+
+def _verified_decoding(
+    train: list[int],
+    families: frozenset[str],
+    walked: dict[str, tuple] | None = None,
+):
+    """``(map, places, decoded)`` for the first family in ``families``
+    that reads and identifies this train, or None.
+
+    ``decoded`` holds each frame's bytes laid on the map's layout, so a
+    frame index means the same thing whether or not an optional leader
+    was sent.
+
+    ``walked``, when given, collects ``(map, frames)`` for each family
+    whose own timing read the train on the way, the frames as read
+    (families whose read failed are left out). The lone-frame path asks
+    the same question of the same maps, and walking the train a second
+    time made it a third slower.
+    """
+    from .field_readers import (
+        _matches_identity,
+        aligned_positioned,
+        bits_to_bytes,
+        library,
+        read_frames_positioned,
+    )
+
+    if not train:
+        return None
+    for field_map in library():
+        if field_map.protocol_id not in families:
+            continue
+        frames, places, failed = read_frames_positioned(
+            field_map.timing, train
+        )
+        if failed:
+            continue
+        if walked is not None:
+            walked[field_map.protocol_id] = (field_map, frames)
+        # Laid on the map's layout, so a code that left out an optional
+        # leader (schema v0.6) still names its setting frames by the
+        # map's own indices. The stand-in leader has no positions and is
+        # never a setting frame, so it contributes nothing to a span.
+        laid = aligned_positioned(field_map, frames, places)
+        if laid is None:
+            continue
+        frames, places = laid
+        decoded = [
+            bits_to_bytes(frame, field_map.bit_order) for frame in frames
+        ]
+        if not _matches_identity(field_map, decoded):
+            continue
+        return field_map, places, decoded
+    return None
+
+
+def read_bytes_key(field_map, frames) -> str | None:
+    """The read-bytes identity of these decoded frames, or None.
+
+    ``frames`` is laid on the map's layout (a frame the caller does not
+    have is an empty tuple). None when any field cannot be read, so a
+    key is never formed from part of what the map says identity is.
+    """
+    import json
+
+    from .field_readers import Reading, read_field
+
+    reading = Reading(
+        field_map.protocol_id, tuple(tuple(frame) for frame in frames)
+    )
+    values: list[list[object]] = []
+    for spec in field_map.fields:
+        value = read_field(reading, spec)
+        if value is None:
+            return None
+        values.append([spec.name, value])
+    payload = json.dumps(
+        [
+            field_map.protocol_id,
+            [list(entry) for entry in field_map.identity_bytes],
+            values,
+        ],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(("read:" + payload).encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# ONE KEY FOR A SETTINGS FRAME TWO FAMILIES SHARE (owner ruling 2026-09-30)
+# ---------------------------------------------------------------------------
+#
+# DAIKIN216 frame 1 and DAIKIN152 frame 3 are the same frame byte for
+# byte: 19 bytes, the same 11 DA 27 header, the same sum(0..17) check in
+# byte 18, and the same field positions where both maps read. A receiver
+# that splits a press at its gaps hands that frame over on its own, and
+# alone it names neither family. So for families whose setting frame is
+# shared, the key belongs to the FRAME, not the family: whole press and
+# lone frame alike, attributed to neither.
+#
+# WHICH FRAMES ARE SHARED is derived, never listed: two families on
+# ``READ_BYTES_VERIFIED``, each with one setting frame that holds every
+# field it reads, share it when the frame's width, its header bytes
+# within the frame and its ratified integrity rules all match. Today
+# that is exactly DAIKIN216 frame 1 and DAIKIN152 frame 3, and a test
+# pins it, so a future map that matches by accident shows up in CI.
+#
+# WHAT THE KEY HOLDS, in this order: the frame signature (width, header
+# bytes, integrity rules), then every distinct (byte, mask) that ANY of
+# the sharing maps reads in that frame, sorted by byte and then mask,
+# each with its raw value. Field names stay out, so two maps naming the
+# same bits differently still agree. The checksum is recomputed and must
+# hold before any key forms, exactly as for a family key.
+#
+# WHAT A USER COULD NOTICE. A DAIKIN216 press and a DAIKIN152 press with
+# identical settings now share a key. With two Daikin units of different
+# generations in one house and one receiver that sees both handsets, a
+# press on one could be heard as a state of the other's remote. Receiver
+# scope on the remote is the existing mitigation; the units themselves
+# do not answer each other's codes.
+
+
+def _frame_signature(field_map, index: int) -> tuple | None:
+    """What makes a setting frame the frame it is, frame-relative."""
+    from .field_readers import RULE_FRAME_REPEAT
+
+    if index >= len(field_map.frame_layout):
+        return None
+    header = tuple(sorted(
+        (byte, value) for frame, byte, value in field_map.identity_bytes
+        if frame == index
+    ))
+    rules = []
+    for rule in field_map.integrity:
+        if not rule.ratified or rule.type == RULE_FRAME_REPEAT:
+            continue
+        if int(rule.params.get("frame", 0) or 0) != index:
+            continue
+        params = {k: v for k, v in rule.params.items() if k != "frame"}
+        rules.append((rule.type, _canonical_json(params)))
+    return (field_map.frame_layout[index], header, tuple(sorted(rules)))
+
+
+def _canonical_json(value) -> str:
+    import json
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _one_setting_frame_holds_all(field_map) -> bool:
+    """The map names one setting frame and reads every field from it.
+
+    Then that one frame carries the whole state, whether or not the
+    rest of the press arrived: what makes a settings frame shareable
+    between two families, and what licenses a lone frame of a family
+    that does not repeat its frame (``_lone_family_frame_key``).
+    """
+    if len(field_map.setting_frames) != 1:
+        return False
+    index = field_map.setting_frames[0]
+    return all(spec.frame == index for spec in field_map.fields)
+
+
+def shared_settings_frames() -> dict[tuple, tuple[tuple[str, int], ...]]:
+    """``{signature: ((family, frame), ...)}`` for every setting frame two
+    or more listed families share. Derived from the maps on each call;
+    the library is cached, so this is cheap."""
+    from .field_readers import library
+
+    groups: dict[tuple, list[tuple[str, int]]] = {}
+    for field_map in library():
+        if field_map.protocol_id not in READ_BYTES_VERIFIED:
+            continue
+        if not _one_setting_frame_holds_all(field_map):
+            continue
+        index = field_map.setting_frames[0]
+        signature = _frame_signature(field_map, index)
+        if signature is None or not signature[1]:
+            continue
+        groups.setdefault(signature, []).append(
+            (field_map.protocol_id, index)
+        )
+    return {
+        signature: tuple(sorted(members))
+        for signature, members in groups.items() if len(members) > 1
+    }
+
+
+def _shared_group_of(protocol_id: str):
+    """``(signature, members)`` of the shared frame this family's setting
+    frame belongs to, or None."""
+    for signature, members in shared_settings_frames().items():
+        if any(family == protocol_id for family, _ in members):
+            return signature, members
+    return None
+
+
+def shared_frame_positions(members) -> tuple[tuple[int, int], ...]:
+    """Every distinct (byte, mask) any sharing map reads, sorted."""
+    from .field_readers import bit_selector, library
+
+    maps = {m.protocol_id: m for m in library()}
+    positions: set[tuple[int, int]] = set()
+    for family, _index in members:
+        for spec in maps[family].fields:
+            mask, _shift = bit_selector(spec.bits)
+            positions.add((spec.byte, mask))
+    return tuple(sorted(positions))
+
+
+def shared_frame_key(signature, members, frame) -> str | None:
+    """The key of one shared settings frame's bytes, or None."""
+    import json
+
+    values: list[list[int]] = []
+    for byte, mask in shared_frame_positions(members):
+        if byte >= len(frame):
+            return None
+        shift = (mask & -mask).bit_length() - 1 if mask else 0
+        values.append([byte, mask, (frame[byte] & mask) >> shift])
+    width, header, rules = signature
+    payload = json.dumps(
+        [width, [list(h) for h in header], [list(r) for r in rules], values],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(("frame:" + payload).encode()).hexdigest()[:16]
+
+
+def _setting_rules_hold(field_map, frames) -> bool:
+    """Every ratified integrity rule on a setting frame evaluates True.
+
+    The key vouches for the bytes it hashes, so a rule that cannot be
+    evaluated counts as failing here.
+    """
+    from .field_readers import RULE_FRAME_REPEAT, Reading, check_integrity
+
+    wanted = set(field_map.setting_frames)
+    reading = Reading(
+        field_map.protocol_id, tuple(tuple(frame) for frame in frames)
+    )
+    for rule in field_map.integrity:
+        if not rule.ratified or rule.type == RULE_FRAME_REPEAT:
+            continue
+        if int(rule.params.get("frame", 0) or 0) not in wanted:
+            continue
+        if check_integrity(reading, rule) is not True:
+            return False
+    return True
+
+
+def read_bytes_hash(timings: list[int] | None) -> str | None:
+    """The read-bytes identity of a capture, or None.
+
+    1. The whole capture reads as a family on ``READ_BYTES_VERIFIED``:
+       the key of its setting frame's fields -- the SHARED frame key when
+       that setting frame is one two listed families share, the family
+       key otherwise.
+    2. It is a lone frame that every family claiming it claims as the
+       same shared settings frame (the judged candidates of
+       ``lone_frame_candidates``, all members of one shared group): the
+       shared frame key, which is the value answer 1 gives for the whole
+       press, so a lone frame from either family finds its cell.
+    3. It is a lone frame one listed family alone claims, as a setting
+       frame its map licenses on its own: that family's key, the value
+       answer 1 gives for the whole press (``_lone_family_frame_key``).
+
+    Otherwise None, and the caller keeps today's identity exactly.
+    """
+    got = _read_bytes(timings)
+    return None if got is None else got[0]
+
+
+def read_bytes_form(
+    timings: list[int] | None,
+) -> tuple[str, str | None] | None:
+    """``(read key, byte form)`` of a capture from ONE decode, or None.
+
+    The key is ``read_bytes_hash``'s. The byte form is a digest of what
+    the map decoded: the protocol id and, for every frame the map's
+    layout attributes to the code, that frame's whole bytes, frames the
+    map reads nothing from included. It answers a different question
+    from the key. The key says which STATE the map reads; the form says
+    whether two codes carry the same BYTES, which is what the cell index
+    asks before it lets two waveforms of one state answer as one (see
+    ``matrix_listener._StateOrCode``).
+
+    Properties that follow from the decode and are relied on:
+
+    - ``bits_to_bytes`` keeps whole bytes only, so a frame one bit over
+      its width inside ``bits_tolerance`` has the same form.
+    - An optional leader that was left out stands in as an empty frame,
+      exactly as a leader that decodes to no whole byte does, so a code
+      with its leader and one without have one form.
+    - Codes whose frames the layout attributes differently never share
+      a form: the frame count is part of it.
+    - The form is None for a lone frame keyed through the shared-frame
+      path, which no layout attributes to either family. A None form is
+      never equal to anything.
+
+    Unlike the key, the form is compared, never stored, and only within
+    one build; it has no on-disk life to keep stable.
+    """
+    got = _read_bytes(timings)
+    if got is None:
+        return None
+    key, decoded = got
+    return key, (None if decoded is None else _byte_form_digest(*decoded))
+
+
+def _byte_form_digest(protocol_id: str, frames) -> str:
+    import json
+
+    payload = json.dumps(
+        [protocol_id, [list(frame) for frame in frames]],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(("bytes:" + payload).encode()).hexdigest()[:16]
+
+
+def _read_bytes(timings: list[int] | None):
+    """``(key, (protocol id, frames laid on the layout) or None)``, or
+    None: the three answers of ``read_bytes_hash``, with what they read.
+    """
+    if not READ_BYTES_VERIFIED:
+        return None
+    train = _stripped(timings)
+    if not train:
+        return None
+    walked: dict[str, tuple] = {}
+    got = _verified_decoding(train, READ_BYTES_VERIFIED, walked)
+    if got is not None:
+        field_map, _places, decoded = got
+        if not _setting_rules_hold(field_map, decoded):
+            return None
+        shared = _shared_group_of(field_map.protocol_id)
+        if shared is not None:
+            signature, members = shared
+            key = shared_frame_key(
+                signature, members, decoded[field_map.setting_frames[0]]
+            )
+        else:
+            key = read_bytes_key(field_map, decoded)
+        return None if key is None else (key, (field_map.protocol_id, decoded))
+    groups = shared_settings_frames()
+    key = _lone_shared_frame_key(train, timings, groups)
+    if key is not None:
+        return key, None
+    return _lone_family_frame_key(timings, walked, groups)
+
+
+def _lone_shared_frame_key(train, timings, groups=None) -> str | None:
+    """Answer 2 of ``read_bytes_hash``. ``groups`` is
+    ``shared_settings_frames()``, when the caller already has it."""
+    from .field_readers import bits_to_bytes, library, read_frames
+
+    if groups is None:
+        groups = shared_settings_frames()
+    if not groups:
+        return None
+    maps = {m.protocol_id: m for m in library()}
+    for signature, members in groups.items():
+        width = signature[0]
+        # Cheap first: one frame of the shared width, read by a member's
+        # own timing. The judged verdict walks every map in the library
+        # and this runs for every code HAIR hashes.
+        first = maps[members[0][0]]
+        frames, failed = read_frames(first.timing, train)
+        if failed or len(frames) != 1:
+            continue
+        if abs(len(frames[0]) - width) > first.bits_tolerance:
+            continue
+        claimants = {
+            (c.protocol_id, c.frame_index)
+            for c in lone_frame_candidates(timings)
+        }
+        if not claimants or not claimants <= set(members):
+            continue
+        decoded = None
+        for family, index in members:
+            field_map = maps[family]
+            got, bad = read_frames(field_map.timing, train)
+            if bad or len(got) != 1:
+                return None
+            as_bytes = bits_to_bytes(got[0], field_map.bit_order)
+            if decoded is not None and as_bytes != decoded:
+                return None
+            decoded = as_bytes
+            laid: list[tuple[int, ...]] = [()] * len(field_map.frame_layout)
+            laid[index] = as_bytes
+            if not _setting_rules_hold(field_map, laid):
+                return None
+        return shared_frame_key(signature, members, decoded)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# A LONE FRAME OF ONE LISTED FAMILY (answer 3 of read_bytes_hash)
+# ---------------------------------------------------------------------------
+#
+# A receiver that ends a capture at the frame gap hands a two-frame
+# press over as two captures. Answer 1 reads neither: each is short of
+# the layout. Answer 2 covers the frame two listed families share and
+# nothing else, so a split press found its state only for a Daikin,
+# where a whole press finds it for every listed family. Both families
+# listed today share that frame, so nothing reaches this answer yet; it
+# is here so that a family joining the list needs no engine change.
+#
+# WHEN A LONE FRAME CARRIES THE STATE. Only where the map says so, two
+# ways:
+#
+# - The reader's half-press licence (``read_code``'s second pass): the
+#   map declares its frames one payload repeated, the frames that came
+#   are the declared width and every setting frame is among them, the
+#   identity bytes match and the frame holds together on the map's own
+#   ratified rules. MITSUBISHI144 and MIDEA_COOLIX hold it.
+# - The map names one setting frame and reads every field from it, so
+#   that frame alone is the whole state though the family does not
+#   repeat it (PANASONIC216's frame 1). This is the shared-frame path's
+#   own precondition; the two Daikins hold it and are skipped below,
+#   because their frame's one key is the shared key.
+#
+# And always: ``identify_lone_frame`` attributes the frame to this
+# family alone, as a setting frame; the frame is laid at the index THAT
+# verdict names (a PANASONIC216 settings frame laid at index 0 reads
+# nothing); and every ratified rule on the setting frames holds. A frame
+# two families claim names neither of them here either.
+#
+# WHAT IT COSTS. ``read_bytes_hash`` runs for every stored row in the
+# load-time backfill, so the order is cheapest first: the frames answer
+# 1 already read with each listed family's timing are reused, a width
+# test against the setting frame comes before any licence, and only a
+# frame that passes both pays ``identify_lone_frame``'s walk of the whole
+# library, once. A family in a shared group is skipped by the groups
+# answer 2 already computed; deriving them again per family made every
+# other family's codes a tenth slower.
+#
+# WHAT A USER COULD NOTICE, once such a family is listed: a trigger
+# learned from a whole press fires on a lone frame of the same state and
+# the reverse, and a known command's lone frame is suppressed as its
+# whole press is, because all of them now carry one key. The two frames
+# of one press arrive about 170 ms apart, inside both dedup windows.
+
+
+def _lone_family_frame_key(timings, walked, groups):
+    """Answer 3 of ``read_bytes_hash``: ``(key, (protocol id, frames))``
+    or None.
+
+    ``walked`` is ``(map, frames)`` per listed family, as answer 1 read
+    the train with that family's timing; ``groups`` the shared settings
+    frames answer 2 used.
+    """
+    # First the width, from what is already in hand: most of what is
+    # hashed is a whole press of another family, which no listed
+    # timing reads as one frame of a listed setting frame's width.
+    single = [
+        (field_map, frames) for field_map, frames in walked.values()
+        if len(frames) == 1 and field_map.setting_frames
+        and abs(
+            len(frames[0])
+            - field_map.frame_layout[field_map.setting_frames[0]]
+        ) <= field_map.bits_tolerance
+    ]
+    if not single:
+        return None
+    shared = {
+        family for members in groups.values() for family, _ in members
+    }
+    from .field_readers import (
+        _matches_identity,
+        _matches_repeat,
+        _payload_holds,
+        bits_to_bytes,
+    )
+
+    verdict: LoneFrame | None = None
+    asked = False
+    for field_map, frames in single:
+        family = field_map.protocol_id
+        if family in shared:
+            continue
+        as_bytes = bits_to_bytes(frames[0], field_map.bit_order)
+        repeats = (
+            _matches_repeat(field_map, frames)
+            and _matches_identity(field_map, [as_bytes])
+            and _payload_holds(field_map, [as_bytes])
+        )
+        if not repeats and not _one_setting_frame_holds_all(field_map):
+            continue
+        if not asked:
+            verdict = identify_lone_frame(timings)
+            asked = True
+        if verdict is None:
+            # Nothing, or more than one thing, claims this frame.
+            return None
+        if verdict.protocol_id != family or not verdict.is_setting:
+            continue
+        laid: list[tuple[int, ...]] = [()] * len(field_map.frame_layout)
+        laid[verdict.frame_index] = as_bytes
+        if not _setting_rules_hold(field_map, laid):
+            return None
+        key = read_bytes_key(field_map, laid)
+        if key is None:
+            return None
+        return key, (family, laid)
+    return None
+
+
+def setting_frame_spans(
+    timings: list[int] | None,
+) -> list[tuple[int, int]] | None:
+    """``[(start, end), ...]`` for each setting frame, or None.
+
+    Word indices into the trailing-zero-stripped train, so a caller
+    holding Pronto words and a caller holding microseconds slice the
+    same boundary from one definition. In map order.
+
+    EACH SPAN IS ITS HEADER PAIR THROUGH ITS STOP MARK (review finding
+    3). ``read_frames_positioned`` records bit pairs only; a frame's
+    stop mark rides in the following pair, together with the gap that
+    closes the frame. A receiver handing over that frame alone ends on
+    that stop mark, and ``canonical_edges`` strips the trailing space
+    after it. A slice ending at the last bit pair is two edges short
+    and equals a lone frame never: measured 0 of 521 with the last bit
+    pair, 521 of 521 including the stop mark.
+
+    None when nothing reads the code or the family is not allowlisted,
+    in which case the caller keeps today's behaviour exactly.
+    """
+    train = _stripped(timings)
+    got = _verified_reading(train)
+    if got is None:
+        return None
+    field_map, places = got
+    spans: list[tuple[int, int]] = []
+    for index in field_map.setting_frames:
+        if index >= len(places) or not places[index]:
+            return None
+        first = places[index][0]
+        if first > 0:
+            mark = abs(train[2 * (first - 1)])
+            space = abs(train[2 * (first - 1) + 1])
+            if (field_map.timing.header_mark.holds(mark)
+                    and field_map.timing.header_space.holds(space)):
+                first -= 1
+        last = places[index][-1]
+        spans.append((2 * first, min(2 * last + 3, len(train))))
+    return spans or None
+
+
+def setting_identity_edges(timings: list[int] | None) -> list[int] | None:
+    """The setting frames' own edges, concatenated, or None."""
+    spans = setting_frame_spans(timings)
+    if spans is None:
+        return None
+    train = _stripped(timings)
+    out: list[int] = []
+    for start, end in spans:
+        out.extend(train[start:end])
+    return out or None
+
+
+def lone_frame_families() -> frozenset[str]:
+    """Allowlisted families a SINGLE frame can still identify.
+
+    Only where the map names one setting frame (owner ruling
+    2026-09-29). A receiver hands over one frame between two gaps, so
+    if the state needs two frames a lone frame does not carry it, and
+    no identity computed from it can name the state. That is a fact
+    about the air, not about this code. TCL112 and GREE are the
+    multi-frame cases; both keep whole-capture identity only.
+
+    Derived from the map rather than a second allowlist, so a map that
+    gains or loses a setting frame changes this with it.
+    """
+    from .field_readers import library
+
+    return frozenset(
+        m.protocol_id for m in library()
+        if m.protocol_id in SETTING_IDENTITY_VERIFIED
+        and len(m.setting_frames) == 1
+    )
+
+
+def field_map_digest() -> str:
+    """What the setting-frame path's answers depend on, as one hash.
+
+    A stored cell index is only as good as the rules that built it, and
+    those rules are not all in this repository's code: they are in the
+    field-map YAML, plus the allowlist above. Edit a map's frame layout
+    or its setting frames and every stored index is answering with
+    boundaries the current library would not choose -- silently,
+    because nothing else in the index's freshness check moves.
+    ``INDEX_FORMAT`` catches a change to the ALGORITHM and the matrix
+    content hash catches a change to the LATTICE; this is the third
+    thing, and it was review finding 2.
+
+    Hashed from the map SOURCE rather than the parsed objects: a parse
+    is lossy by design (unknown keys are dropped), and a key this code
+    ignores today may be one it reads tomorrow. That also means the
+    map version schema v0.5 derives per map rides along without this
+    needing to know about it.
+    """
+    from .field_readers import maps_dir
+
+    hasher = hashlib.sha256()
+    hasher.update(("|".join(setting_identity_families())).encode())
+    # The read-bytes list decides what a listed family's byte hash IS,
+    # so a family joining it rebuilds every stored index, the same way
+    # a map edit does.
+    hasher.update(("|read:" + "|".join(read_bytes_families())).encode())
+    try:
+        paths = sorted(maps_dir().glob("*.yaml"))
+    except OSError:  # pragma: no cover - a missing directory is not a crash
+        paths = []
+    for path in paths:
+        hasher.update(path.name.encode())
+        try:
+            hasher.update(path.read_bytes())
+        except OSError:  # pragma: no cover
+            hasher.update(b"<unreadable>")
+    return hasher.hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class LoneFrame:
+    """One frame of a multi-frame family, recognized on its own.
+
+    ``judged`` is the whole point (review finding 5). A frame index a
+    map says nothing about -- no identity byte, no ratified rule that
+    names it -- passes every test it has, because it has none. GREE
+    frame 1 is 32 bits with neither, so under a rule that only asks
+    "did anything fail", every 32-bit capture in the world qualifies as
+    a GREE preamble: the census had 46 rows doing exactly that, and
+    they were a Samsung TV button and real NEC presses. A verdict is
+    only a verdict when something was actually checked.
+    """
+
+    protocol_id: str
+    frame_index: int
+    is_setting: bool
+
+
+def lone_frame_candidates(timings: list[int] | None) -> list[LoneFrame]:
+    """Every (family, frame) this single frame could be, judged.
+
+    A candidate needs a width inside the map's tolerance AND at least
+    one identity byte or ratified non-repeat rule EVALUATED on that
+    frame index, all of them passing. ``frame_repeat`` is skipped: it
+    is a statement about a frame's relationship to other frames, and
+    there are no other frames here.
+    """
+    from .field_readers import (
+        RULE_FRAME_REPEAT,
+        IntegrityRule,
+        Reading,
+        bits_to_bytes,
+        check_integrity,
+        library,
+        read_frames,
+    )
+
+    train = _stripped(timings)
+    if not train:
+        return []
+    out: list[LoneFrame] = []
+    for field_map in library():
+        frames, failed = read_frames(field_map.timing, train)
+        if failed or len(frames) != 1:
+            continue
+        bits = frames[0]
+        for index, width in enumerate(field_map.frame_layout):
+            if abs(len(bits) - width) > field_map.bits_tolerance:
+                continue
+            decoded = bits_to_bytes(bits, field_map.bit_order)
+            judged = False
+            passes = True
+            for frame_index, byte_index, value in field_map.identity_bytes:
+                if frame_index != index:
+                    continue
+                judged = True
+                if byte_index >= len(decoded) or decoded[byte_index] != value:
+                    passes = False
+            for rule in field_map.integrity:
+                if not rule.ratified or rule.type == RULE_FRAME_REPEAT:
+                    continue
+                if int(rule.params.get("frame", 0) or 0) != index:
+                    continue
+                params = dict(rule.params)
+                params["frame"] = 0
+                verdict = check_integrity(
+                    Reading(field_map.protocol_id, (decoded,)),
+                    IntegrityRule(rule.type, params, rule.confidence, ""),
+                )
+                if verdict is None:
+                    continue
+                judged = True
+                if not verdict:
+                    passes = False
+            if judged and passes:
+                out.append(LoneFrame(
+                    field_map.protocol_id, index,
+                    index in field_map.setting_frames,
+                ))
+    return out
+
+
+def identify_lone_frame(timings: list[int] | None) -> LoneFrame | None:
+    """The one family and frame this is, or None.
+
+    None when nothing qualifies AND when more than one thing does: a
+    frame two families both claim names neither of them. Callers key
+    on this verdict object, never on a fingerprint coming back None --
+    "no identity" and "this is a known preamble" are different answers
+    and only one of them is safe to act on.
+    """
+    candidates = lone_frame_candidates(timings)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def identity_frame(timings: list[int] | None) -> list[int]:
+    """The edges identity is computed on.
+
+    Three answers, in order:
+
+    1. The setting frames concatenated, when the whole capture reads as
+       an allowlisted family.
+    2. The frame itself, when this is a LONE frame that an allowlisted
+       single-setting-frame family recognizes as its setting frame --
+       which is what makes a receiver's half-press meet the same
+       lattice cell the whole press does.
+    3. Otherwise exactly what this layer has always used:
+       ``first_frame`` of the UNSIGNED edges. Unsigned matters --
+       ``first_frame`` only counts positive spaces, so handing it
+       signed edges moves unmapped rows that nothing asked to move
+       (review finding 3).
+
+    A lone NON-setting frame (a Daikin preamble, say) falls to 3 rather
+    than being suppressed. It will match nothing, because no cell is
+    indexed on it, and "no match" is the honest answer without this
+    layer having to invent a special one.
+    """
+    setting = setting_identity_edges(timings)
+    if setting is not None:
+        return [abs(v) for v in setting]
+    verdict = identify_lone_frame(timings)
+    if (verdict is not None
+            and verdict.is_setting
+            and verdict.protocol_id in lone_frame_families()):
+        return canonical_edges(timings)
+    return first_frame(canonical_edges(timings))
+
+
 def norm_fingerprint(timings: list[int] | None) -> str | None:
     """The receiver-tolerant fingerprint of one code, or None.
 
@@ -498,7 +1422,7 @@ def norm_fingerprint(timings: list[int] | None) -> str | None:
     structure at all (every run in one level) -- such a value would
     match anything of the same length and is worse than no answer.
     """
-    edges = canonical_edges(first_frame(canonical_edges(timings)))
+    edges = canonical_edges(identity_frame(timings))
     marks = edges[0::2]
     spaces = edges[1::2]
     # Also the degenerate case (GH #108): an all-zero code strips to no
@@ -516,6 +1440,124 @@ def norm_fingerprint(timings: list[int] | None) -> str | None:
         for i in range(len(edges))
     ]
     payload = f"{len(edges)}|" + "".join(str(level) for level in sequence)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _value_levels(values: list[int], ratio: float) -> list[int]:
+    """``_level_labels`` generalized from two levels to as many as the
+    values actually show.
+
+    Sort, then start a new level wherever consecutive sorted values jump
+    by ``ratio`` or more. Every boundary therefore sits inside a real
+    gap in the data rather than at a fixed microsecond, which is what
+    makes the result survive jitter: a value has to cross a genuine
+    cluster gap to change level, not merely drift.
+
+    ``_level_labels`` itself stays two-level and untouched:
+    ``norm_fingerprint`` is a MATCHING identity and its coarseness is
+    deliberate. This is for telling two records apart, which needs to
+    see more than "long or short".
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: values[i])
+    labels = [0] * n
+    level = 0
+    for position in range(1, n):
+        previous = values[order[position - 1]]
+        current = values[order[position]]
+        if previous > 0 and current / previous >= ratio:
+            level += 1
+        labels[order[position]] = level
+    return labels
+
+
+def whole_code_discriminator(
+    timings: list[int] | None, frame_identity: str | None = None
+) -> str | None:
+    """"Are these two records the same code?", over EVERY frame.
+
+    THE DISCRIMINATOR AN INDEX REFUSES ON (owner bench 2026-09-25).
+    ``NormFpIndex`` and the cell index's other tiers poison a key that
+    two genuinely different codes claim, and to do that they need a
+    value saying WHICH code a record is. The byte hash cannot be that
+    value for a lattice: ``_pronto_identity_timings`` stops at the first
+    gap, so all 520 cells of a Daikin 216 lattice share one byte hash,
+    one S/L fingerprint and one normalized fingerprint, every one of
+    them computed from the single constant frame 0. An index given only
+    those cannot tell a repeated waveform from a genuinely different
+    state, so it kept whichever came last -- the Off code, which
+    ``build_cell_index`` adds after the cells.
+
+    So this reads the whole code, on the levels its own edges show.
+
+    QUANTIZED, NOT EXACT (owner ruling 2026-09-25). Exact edges would be
+    a sharper test and the wrong one: not every lattice is pristine file
+    text. A lattice built from captures -- a WigFactory pull, a repaired
+    or listened cell -- can hold one waveform twice with microseconds
+    between the two, and exact edges would call those different codes
+    and refuse a pair that is really one press. Measured on the Komeco
+    PR-19 lattices, which are capture-built: seven such pairs, each
+    differing on up to 134 of 197 edges, and every difference a wobble
+    inside its own cluster (short marks 447-579, long spaces
+    1578-1709). Not one position crosses between the short-space and
+    long-space clusters, which is what a different bit would look like.
+
+    WHY LEVELS AND NOT A FIXED TOLERANCE. Bucketing each edge at a fixed
+    ratio was measured first and fails: with ~200 edges, some edge sits
+    near a bucket boundary in almost every code, so jitter flips it and
+    two captures of one press stop matching. Levels put every boundary
+    inside a real gap in that code's own values, which survived all
+    2,560 synthetic jitter cases in the bench sweep.
+
+    WHY NOT ``norm_fingerprint``'s TWO LEVELS OVER EVERY FRAME. Also
+    measured, also fails, in the other direction: two levels are too few
+    to carry a payload, and the Komeco lattices collapsed from 836
+    distinct codes to 15 discriminators. Two levels answer "is this
+    edge long or short"; telling states apart needs "which of this
+    code's several widths is it".
+
+    IT FOLDS IN THE OLD DISCRIMINATOR RATHER THAN REPLACING IT.
+    ``frame_identity`` is the record's existing frame-0 identity -- its
+    byte hash, or its fingerprint when it has no hash -- which is
+    exactly the value callers passed as the whole discriminator before
+    this function existed. It is still needed, because levels are
+    RATIOS and therefore blind to scale: the same code played 15%
+    slower has every ratio unchanged and would otherwise read as the
+    same waveform, when it is a different one (pinned by
+    test_matrix_listener's one-shape-twice test). Frame 0 sees that;
+    the levels see the payload frame 0 is blind to. Together they
+    answer both ways round.
+
+    The pairing is measured, not assumed: on the capture-built Komeco
+    lattices the seven jitter-twin pairs agree on BOTH halves, because
+    the byte hash is quantized and survived all 180 small-jitter cases
+    in the bench sweep.
+
+    WHICH WAY IT FAILS. Equal discriminators MERGE (the key resolves);
+    different ones REFUSE (the key answers nothing). Merging wrongly
+    names a state nobody pressed; refusing wrongly says nothing. Every
+    uncertainty here therefore resolves towards refusing, which is also
+    why the two halves are ANDed: disagree on either and the pair is
+    refused.
+
+    Returns None only for a code with no edges at all, which carries no
+    identity of any kind (GH #108).
+    """
+    edges = canonical_edges(timings)
+    if not edges:
+        return None
+    mark_levels = _value_levels(edges[0::2], NORM_LEVEL_MIN_RATIO)
+    space_levels = _value_levels(edges[1::2], NORM_LEVEL_MIN_RATIO)
+    sequence = [
+        mark_levels[i // 2] if i % 2 == 0 else space_levels[i // 2]
+        for i in range(len(edges))
+    ]
+    payload = (
+        f"{frame_identity or ''}|{len(edges)}|"
+        + ",".join(str(level) for level in sequence)
+    )
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 

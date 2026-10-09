@@ -1,0 +1,24 @@
+{
+ "protocol": "FUJITSU128",
+ "how_to_read": "Each entry names one coordinate of the .defects.json lattice that was deliberately corrupted. Every other coordinate is byte-identical to the clean pack.",
+ "defects": [
+  {
+   "defect": "mode_wrong_value",
+   "field": "mode",
+   "mode": "cool",
+   "fan": "auto",
+   "swing": null,
+   "temp": 18.0,
+   "note": "mode field forced to 0x02 (map says 0x01); integrity recomputed so only the field check can catch it"
+  },
+  {
+   "defect": "checksum_broken",
+   "field": null,
+   "mode": "cool",
+   "fan": "auto",
+   "swing": null,
+   "temp": 20.0,
+   "note": "checksum byte incremented; only the integrity check sees it"
+  }
+ ]
+}

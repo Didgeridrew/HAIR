@@ -35,6 +35,8 @@ import type {
     LearnedStoreImport,
     MatrixCellDetail,
     MatrixCells,
+    MatrixThinResult,
+    MatrixThinShape,
     PluckRunResult,
     PluckSource,
     PluckVendor,
@@ -149,6 +151,9 @@ export class HairApi {
             power_sensor_entity_id: string | null;
             power_off_below_w: number | null;
             power_on_above_w: number | null;
+            // null returns the device to the default settle time;
+            // 0 turns the window off. Cleared with the sensor.
+            power_settle_s: number | null;
             // Climate room sensors (climate-sensors.md), riding 0.9.8:
             // independent of each other and of the power fields above
             // -- either clears on its own with a null.
@@ -424,6 +429,22 @@ export class HairApi {
             device_id: deviceId,
             ...coords,
             ...latticeFields({ axis, lattice }),
+        });
+    }
+
+    /** Remove the states a device does not have (thinning-plan.md 2).
+     * Sends the WHOLE desired shape, never a diff: a lattice or a mode
+     * absent from ``shape`` is removed. Returns the record, the wig
+     * write-through's own answer, and the full device to reload from. */
+    matrixThin(
+        deviceId: string,
+        shape: MatrixThinShape,
+    ): Promise<MatrixThinResult> {
+        return this.hass.connection.sendMessagePromise<MatrixThinResult>({
+            type: "hair/devices/matrix-thin",
+            device_id: deviceId,
+            keep_on: shape.keep_on,
+            lattices: shape.lattices,
         });
     }
 
@@ -1901,12 +1922,27 @@ export interface PluckEmptyBlock {
  *   not loaded  pluck.empty.source.<id>.not_installed
  *               pluck.empty.not_installed
  *
+ * One source is exempt from the not-loaded line entirely. HAIR reads
+ * OpenIRBlaster's code library for people who already have one; it is
+ * not a route HAIR suggests setting up. Its block appears only where it
+ * applies: the integration is loaded, or a store of its codes is
+ * sitting in .storage. See UNADVERTISED_SOURCES below.
+ *
  * A source that resolves to nothing contributes no block rather than
  * printing its own key at the user: `t()` falls back to en and then to
  * the key itself, and a raw `pluck.empty.source.foo` on screen is
  * worse than silence. A provider added later needs its own key added
  * with it, or it inherits the generic not-installed line.
  */
+/**
+ * Sources HAIR can read but does not recommend.
+ *
+ * A source in here gets a block only when this install actually has it.
+ * Everything else still gets its not-installed line, which is what makes
+ * the empty tab a shop window for the routes worth taking.
+ */
+const UNADVERTISED_SOURCES = new Set(["openirblaster"]);
+
 export function pluckEmptyBlocks(
     sources: PluckSource[] | null | undefined,
     translate: (key: string, subs?: Record<string, string | number>) => string,
@@ -1922,6 +1958,12 @@ export function pluckEmptyBlocks(
     const blocks: PluckEmptyBlock[] = [];
     for (const source of sources ?? []) {
         if (Object.values(source.ready).includes(true)) continue;
+        // Loaded, or a store of its codes on disk. Written as the rule
+        // reads rather than leaning on the line above: a source with a
+        // store is ready, and a reader should not have to notice that to
+        // see that this block only appears where it applies.
+        const present = source.loaded || source.ready.storage === true;
+        if (UNADVERTISED_SOURCES.has(source.integration) && !present) continue;
         const base = `pluck.empty.source.${source.integration}`;
         const body = source.loaded
             ? resolve(

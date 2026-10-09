@@ -178,6 +178,10 @@ export interface MatrixSummary {
     min_temp: number;
     max_temp: number;
     unit: "C" | "F";
+    // What a trim cost, for the summary line's last clause (owner
+    // ruling 2026-09-22). Present only on a trimmed matrix: "from" is
+    // the size before the FIRST trim, "to" what it holds now.
+    trimmed?: { from: number; to: number };
 }
 
 // One cell's coordinates in the cell-browser payload (Cold Cuts second
@@ -832,6 +836,18 @@ export interface LastHeard {
     // a row persisted before then carries neither.
     axis?: string | null;
     lattice?: string | null;
+    // What the press does NOT pin down: a file that stores one code
+    // under several settings (dry at every temperature, when the unit
+    // ignores it there) cannot say which of them was pressed. Each
+    // dimension the stored cells disagree on, with its values; empty
+    // on a press that pins every setting. The coordinates above stay
+    // the representative's, for door 1 and the branch seed.
+    spanned?: Record<string, (string | number | null)[]>;
+    // On a spanned press only: every member cell's coordinates,
+    // [mode, fan, swing, temp], so a tile rings only on a cell that
+    // really carries this code. Optional, like ``spanned``: a row
+    // persisted before them carries neither.
+    members?: (string | number | null)[][];
     at: string;
     sl_pattern: string | null;
     receiver_entity_id: string | null;
@@ -905,6 +921,10 @@ export interface IRDevice {
     power_sensor_entity_id: string | null;
     power_off_below_w: number | null;
     power_on_above_w: number | null;
+    // The settle window (0.17.2): seconds after a HAIR send before the
+    // power sensor can overrule the entity. null is the backend
+    // default (20), 0 is no window. Never treat null as 0.
+    power_settle_s: number | null;
     // Climate room sensors (climate-sensors.md, riding 0.9.8), commit
     // 1: which thermometer/hygrometer feeds this device's thermostat
     // card. Both null means "not configured" -- unlike power, the two
@@ -1526,6 +1546,10 @@ export interface TangleRow {
     /** Present only on rows already answered by KEEP -- these live in
      * ``TangleListing.attested``, not ``TangleListing.rows``. */
     attested?: TangleAttestation | null;
+    /** The server's tangles.is_unusual for this open row (GH #177):
+     * every class is in ``TangleListing.unusual_classes`` and HAIR has
+     * no candidate for it. Set on ``rows`` only. */
+    unusual?: boolean;
 }
 
 export interface TangleCluster {
@@ -1556,6 +1580,10 @@ export interface TangleListing {
     protocol: string | null;
     field_tier: "read" | "protocol-unmapped" | "no-lattice";
     candidate_sources: ("donor" | "capture" | "paste")[];
+    /** tangles.UNUSUAL_CLASSES, served so the list lives in one place.
+     * Bucketing reads each row's ``unusual`` flag; this is the list
+     * behind it, for anything that needs to name the classes. */
+    unusual_classes?: string[];
 }
 
 /** What every mutating tangle command reports under ``wig``: whether
@@ -1568,6 +1596,30 @@ export interface TangleWriteThrough {
     filename?: string;
     wig_id?: string;
     replaced?: string;
+}
+
+/** The whole desired shape ``hair/devices/matrix-thin`` takes
+ * (thinning-plan.md 2). Built by ``matrix-thin.ts``'s thinPayload. */
+export interface MatrixThinShape {
+    keep_on: boolean;
+    lattices: Array<{
+        axis: string | null;
+        key: string | null;
+        modes: Array<{
+            mode: string;
+            fans: string[] | null;
+            swings: string[] | null;
+            temps: number[] | null;
+        }>;
+    }>;
+}
+
+/** What the thinning door answers: the record it wrote, the repairs'
+ * write-through result, and the full device to reload from. */
+export interface MatrixThinResult {
+    thinned: Record<string, unknown>;
+    wig: TangleWriteThrough;
+    device: IRDevice;
 }
 
 export interface TangleCaptureEvent {

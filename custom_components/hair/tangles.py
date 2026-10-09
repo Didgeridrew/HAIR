@@ -40,9 +40,12 @@ from . import field_readers
 from .models import IRCommand, IRDevice
 from .wig_comb import (
     ADVISORY_CHECKS,
+    CHECK_BYPASS_WITH_DITTOS,
     CHECK_DUPLICATE_LABELS,
     CHECK_DUPLICATED_NEIGHBOUR,
     CHECK_FIELD_MISMATCH,
+    CHECK_FRAME_SHAPE,
+    CHECK_RAMP_DITTOS,
     CHECK_STRAY_BURST,
     FIELD_COORDINATE,
     POWER_FIELD,
@@ -71,6 +74,26 @@ TARGET_COMMAND = "command"
 FIELD_TIER_UNMAPPED = "protocol-unmapped"
 FIELD_TIER_NO_LATTICE = "no-lattice"
 FIELD_TIER_READ = "read"
+
+#: Findings that mean "this looks unusual" rather than "this is wrong"
+#: (owner ruled 2026-09-27, GH Discussion #177). A code a person has
+#: sent to their own device and watched work can be kept as it is, and
+#: a row made only of these does not hold up a Perfect Fit.
+#:
+#: THE ONE LIST. The listing serves it as ``unusual_classes`` and marks
+#: each row with ``unusual``, so the panel never carries a copy that
+#: could drift from this one.
+#:
+#: The two ditto classes are advisory in the comb and never become rows
+#: today; they sit here so the list is already right on the day an
+#: advisory is promoted. ``stray-cell`` is deliberately absent this
+#: round.
+UNUSUAL_CLASSES: tuple[str, ...] = (
+    CHECK_FRAME_SHAPE,
+    CHECK_STRAY_BURST,
+    CHECK_BYPASS_WITH_DITTOS,
+    CHECK_RAMP_DITTOS,
+)
 
 
 @dataclass(frozen=True)
@@ -170,7 +193,11 @@ class TangleListing:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "rows": [row.as_dict() for row in self.rows],
+            "rows": [
+                {**row.as_dict(), "unusual": is_unusual(row)}
+                for row in self.rows
+            ],
+            "unusual_classes": list(UNUSUAL_CLASSES),
             "clusters": [c.as_dict() for c in self.clusters],
             "advisories": [dict(a) for a in self.advisories],
             "attested": [dict(a) for a in self.attested],
@@ -180,6 +207,37 @@ class TangleListing:
             "field_tier": self.field_tier,
             "candidate_sources": list(self.candidate_sources),
         }
+
+
+def is_unusual(row: TangleRow) -> bool:
+    """Whether a row belongs on the Unusual card.
+
+    Two conditions, both required (owner ruled 2026-09-28):
+
+    - EVERY class on it is in ``UNUSUAL_CLASSES``. One class from
+      anywhere else and the row stays where it lands today, because
+      the stricter bucket wins: a frame that is both an odd shape and
+      malformed is malformed.
+    - It has NO candidate of its own. A row HAIR can already repair
+      (a trimmable stray burst on a lattice) stays under Fixes ready,
+      so Accept All keeps covering it. Unusual is for the rows where
+      the only honest answers are "it works, keep it" or a fresh
+      press.
+    """
+    if not row.classes or row.has_donor:
+        return False
+    return all(check in UNUSUAL_CLASSES for check in row.classes)
+
+
+def blocking_rows(listing: TangleListing) -> list[TangleRow]:
+    """The open rows that hold up a Perfect Fit.
+
+    Everything open except Unusual. An unusual row is a doubt about
+    shape, not a claim that the bytes are wrong, so it does not stand
+    between a person and signing a fit (owner ruled 2026-09-27). It
+    still stays open, marked and listed, until somebody keeps it.
+    """
+    return [row for row in listing.rows if not is_unusual(row)]
 
 
 def row_id(kind: str, key: str) -> str:
@@ -527,26 +585,87 @@ def _mismatched_fields(findings: list[dict[str, Any]]) -> list[str]:
     return names
 
 
-def _coordinate_of(cell: ClimateCell, field_name: str) -> Any:
+#: The four label coordinates every lattice cell carries. These, and
+#: only these, are what a field can be said to answer.
+_CELL_AXES = ("mode", "fan", "swing", "temp")
+
+
+def _axis_of(spec: Any) -> str | None:
+    """Which of the cell's four label axes a map field answers, or None.
+
+    The field's own ``coordinate`` wins where the map states one, and
+    the comb's name table answers the rest -- the same reading the comb
+    files its findings by, so a finding the comb raised on DAIKIN216's
+    ``swing_vertical`` or DAIKIN152's ``powerful`` is searched on the
+    axis it was raised on rather than on none at all.
+
+    Power answers no axis. It is the difference between the cells and
+    the off code, not a dimension of the lattice, and every caller
+    treats it on its own. A coordinate outside the four is None as
+    well: the schema takes any string, and a field that named
+    ``pronto`` would otherwise anchor a search on the code itself.
+    """
+    if spec is None or spec.name == POWER_FIELD:
+        return None
+    axis = spec.coordinate or FIELD_COORDINATE.get(spec.name)
+    return axis if axis in _CELL_AXES else None
+
+
+def _cell_coords(cell: ClimateCell) -> dict[str, Any]:
+    return {
+        "mode": cell.mode, "fan": cell.fan,
+        "swing": cell.swing, "temp": cell.temp,
+    }
+
+
+def _coordinate_of(
+    cell: ClimateCell, field_name: str, lattice: LatticeReading | None = None
+) -> Any:
+    """The label a cell claims for one field.
+
+    Given the lattice, the field is resolved through its map, so a
+    field the map places by its own coordinate answers that axis. The
+    donor search, the read-back and the sibling check ask this way.
+
+    Without one, only the name table answers, and that is deliberate.
+    The witness road asks without a lattice: it rewrites ONE field, and
+    on an axis two fields answer (DAIKIN216's two vanes) or four do
+    (DAIKIN152's fan), whatever the sibling carries in the others
+    would ride into the built code unchecked. So a field outside the
+    table computes no value there and the road refuses it, as it always
+    has, until the road can rewrite a whole axis at once.
+    """
     if field_name == POWER_FIELD:
         return "on"
-    axis = FIELD_COORDINATE.get(field_name)
+    if lattice is None:
+        axis = FIELD_COORDINATE.get(field_name)
+    else:
+        spec = lattice.spec_for(field_name)
+        axis = (_axis_of(spec) if spec is not None
+                else FIELD_COORDINATE.get(field_name))
     return None if axis is None else getattr(cell, axis, None)
 
 
-def _elsewhere(cell: ClimateCell, exclude: set[str]) -> tuple:
+def _elsewhere(cell: ClimateCell, exclude_axes: set[str]) -> tuple:
     """The cell's coordinates on every axis the search is NOT varying.
 
     A donor has to be the same cell in every respect except the thing
     that is wrong with the target. Without this the search would happily
     offer a cooling frame to repair a heating one, because the only
     field it can compare is the one they agree on.
+
+    Always the cell's four label axes, never the axes a map happens to
+    have fields for. A map with no swing field (PANASONIC216) still
+    sends a swing in bytes it does not read, and an anchor built from
+    the map would let a cell at another swing donate for a temperature
+    finding -- a repair that reads right and sends the wrong vane. What
+    is excluded is an AXIS, so a finding on ``swing_vertical`` frees the
+    swing axis, which excluding it by name never did.
     """
-    axes = [
-        axis for name, axis in FIELD_COORDINATE.items()
-        if name not in exclude
-    ]
-    return tuple(getattr(cell, axis, None) for axis in sorted(axes))
+    return tuple(
+        getattr(cell, axis, None) for axis in _CELL_AXES
+        if axis not in exclude_axes
+    )
 
 
 def find_trim(
@@ -631,6 +750,12 @@ def find_trim(
         verdict = pre_read(lattice, trimmed, coordinates)
         if verdict.matches is False:
             return None, TRIM_READS_WRONG
+        if verdict.protocol != lattice.field_map.protocol_id:
+            # The map that reads this lattice does not read the trimmed
+            # bytes at all, so nothing vouches for them, and the apply
+            # gates would hold them for a declaration the card cannot
+            # ask for. A fix the listing offers is one apply accepts.
+            return None, TRIM_UNREAD
 
     return {
         "key": key,
@@ -698,6 +823,32 @@ def find_donor(
     sends what this cell is supposed to send, that frame is the repair.
     If none does, the search says so and stops -- which is the whole
     reason the witnessed-capture road exists.
+
+    THE SEARCH VARIES AXES, NOT FIELDS. A finding names one field, but
+    a donor is another cell, and another cell differs on a whole label
+    axis. DAIKIN216 answers swing with two vanes and DAIKIN152 answers
+    the fan with a speed and three flags, so a donor found by the one
+    field the comb named could send the right vertical vane and the
+    wrong horizontal one. Every field answering a varying axis is
+    therefore held to what the target's label implies wherever the map
+    can compute it, provisional fields included: a provisional economy
+    flag is still a setting the unit acts on, and a high cell offered
+    an economy code would send economy. Only where the map cannot
+    compute a value (a label outside a field's vocabulary) is the
+    target's own reading held instead, which is no worse than the map
+    can know.
+
+    WHAT THE MAP SAYS APPLIES. A field the map says carries nothing at
+    the target (the fan in dry, where the unit forces it) is not
+    compared, so a dry cell can donate whatever its fan bits hold. But
+    no field may apply at the donor's label that does not apply at the
+    target's: a Fahrenheit label and a Celsius one share a byte on
+    MITSUBISHI144, and a 76 F cell carrying 24.5 C would otherwise pass
+    for a 24 C target, because the half-degree bit only the Fahrenheit
+    field reads is never compared. The other way round is safe and is
+    allowed: where FEWER fields apply at the donor's label (a dry cell
+    carrying a cool code), every field that applies at the target is
+    still read from the donor's bytes and held to the target's label.
     """
     if not lattice.readable:
         return None, ABSTAIN_UNREADABLE
@@ -708,24 +859,62 @@ def find_donor(
     if not fields:
         return None, ABSTAIN_NOT_A_FIELD
 
-    wanted: dict[str, int] = {}
+    wanted: dict[str, int | None] = {}
+    varying: set[str] = set()
     for name in fields:
         spec = lattice.spec_for(name)
         if spec is None or not spec.ratified:
             return None, ABSTAIN_NOT_RATIFIED
-        expected = field_readers.expected_value(
-            spec, _coordinate_of(target, name)
-        )
-        if expected is None:
+        if name == POWER_FIELD:
+            # Required at "on" and varying nothing: every cell is an on
+            # code, so a cell that reads off is wrong wherever it sits.
+            expected = field_readers.expected_value(spec, "on")
+            if expected is None:
+                return None, ABSTAIN_NOT_RATIFIED
+            wanted[name] = expected
+            continue
+        axis = _axis_of(spec)
+        if axis is None:
+            # A field the map vouches for that answers no label axis has
+            # no other cell to come from: nothing about a neighbour's
+            # label says what it would carry.
+            return None, ABSTAIN_NOT_A_FIELD
+        if field_readers.expected_value(
+                spec, getattr(target, axis, None)) is None:
             return None, ABSTAIN_NOT_RATIFIED
-        wanted[name] = expected
+        varying.add(axis)
 
-    varying = set(fields)
+    # Resolved once per search, not once per candidate: the listing runs
+    # this for every row, and a large lattice has a thousand cells.
+    field_map = lattice.field_map
+    mode_spec = field_map.field_named("mode")
+    on_axis = [spec for spec in field_map.fields
+               if _axis_of(spec) in varying]
+
+    def _applies(coordinates: dict[str, Any]) -> tuple[bool, ...]:
+        return tuple(
+            field_readers.field_skip_reason(
+                spec, mode_spec, coordinates) is None
+            for spec in on_axis
+        )
+
+    shape = _applies(_cell_coords(target))
+    for spec, applies in zip(on_axis, shape, strict=True):
+        if not applies:
+            continue
+        expected = field_readers.expected_value(
+            spec, getattr(target, _axis_of(spec), None))
+        wanted[spec.name] = (
+            expected if expected is not None else lattice.reads(key, spec))
+
     anchor = _elsewhere(target, varying)
     for candidate_key, candidate in lattice.cells.items():
         if candidate_key == key:
             continue
         if _elsewhere(candidate, varying) != anchor:
+            continue
+        if any(here and not there for here, there in zip(
+                _applies(_cell_coords(candidate)), shape, strict=True)):
             continue
         if any(
             lattice.reads(candidate_key, lattice.spec_for(name)) != value
@@ -746,10 +935,12 @@ def find_donor(
             "reasoning": {
                 "fields": list(fields),
                 "labelled": {
-                    name: _coordinate_of(candidate, name) for name in fields
+                    name: _coordinate_of(candidate, name, lattice)
+                    for name in fields
                 },
                 "reads_as": {
-                    name: _coordinate_of(target, name) for name in fields
+                    name: _coordinate_of(target, name, lattice)
+                    for name in fields
                 },
             },
         }, None
@@ -884,7 +1075,22 @@ def pre_read(
             reading, rule
         )
 
+    # Every ratified field is compared on the axis it answers, by the
+    # field's own coordinate where the map states one -- the reading the
+    # comb files its findings by -- so a code that sends the wrong vane
+    # on DAIKIN216 no longer reads True for a swing label. And nowhere
+    # the map says the field carries nothing, so a dry code is not
+    # refused for a fan the unit forces in dry. This is the check a
+    # donor, a trim and a pasted or captured code all pass before they
+    # are written.
+    #
+    # A field outside the name table is compared but not NAMED: its
+    # bytes are a share of a setting another field also answers, and
+    # naming them on their own (a powerful flag of 0 read as "economy")
+    # says something the code does not send. Its claim and its reading
+    # stay out of the verdict's labels until a combination can be named.
     comparable = []
+    mode_spec = field_map.field_named("mode")
     for spec in field_map.fields:
         if not spec.ratified:
             continue
@@ -898,17 +1104,21 @@ def pre_read(
             verdict.reads_as[spec.name] = label
         if coordinates is None:
             continue
-        axis = FIELD_COORDINATE.get(spec.name)
+        axis = _axis_of(spec)
         claimed = (
             coordinates.get(POWER_FIELD, "on") if spec.name == POWER_FIELD
             else (None if axis is None else coordinates.get(axis))
         )
         if claimed is None:
             continue
+        if spec.name != POWER_FIELD and field_readers.field_skip_reason(
+                spec, mode_spec, coordinates) is not None:
+            continue
         expected = field_readers.expected_value(spec, claimed)
         if expected is None:
             continue
-        verdict.claims[spec.name] = claimed
+        if spec.name == POWER_FIELD or spec.name in FIELD_COORDINATE:
+            verdict.claims[spec.name] = claimed
         verdict.raw_expected[spec.name] = expected
         comparable.append(spec.name)
         if expected != value:
@@ -966,6 +1176,41 @@ APPLY_NOT_TESTED = "not_tested"
 APPLY_BAD_CANDIDATE = "bad_candidate"
 APPLY_DISAGREEMENT_UNDECLARED = "reading_disagreed_required"
 APPLY_NOTHING_TO_REVERT = "nothing_to_revert"
+
+#: Why a candidate needs USE IT ANYWAY before it is written.
+DECLARE_READS_OTHERWISE = "reads-otherwise"
+DECLARE_UNREAD = "unread"
+
+
+def declaration_needed(
+    lattice: LatticeReading, target: TangleTarget, verdict: dict[str, Any]
+) -> str | None:
+    """Does writing this candidate at this target need a declaration?
+
+    ONE PREDICATE FOR EVERY APPLY GATE, on the verdict as a dict, which
+    is the form both the single apply and the batch plan carry. Two
+    answers. The bytes read as something other than the target claims
+    (``matches`` False). Or the target is a lattice cell, the lattice
+    has a map, and the map does not read the bytes at all (no
+    ``protocol``): a code from another remote, or a capture cut short.
+    That is the verdict's own word for a failed reading, keyed on no
+    reason string, so a reason renamed or added later cannot open it,
+    and compared with the lattice's own map rather than with None, so a
+    verdict that one day names a decoder's protocol cannot open it
+    either.
+
+    Not for a flat command, which has no label to read against, nor for
+    the matrix's Off and On: several families send an Off frame their
+    map does not read (every Fujitsu 128-bit file on record), so a
+    correct Off would otherwise be held as a foreign code.
+    """
+    if verdict.get("matches") is False:
+        return DECLARE_READS_OTHERWISE
+    if (lattice.readable and target.kind == TARGET_CELL
+            and not is_power_key(target.key)
+            and verdict.get("protocol") != lattice.field_map.protocol_id):
+        return DECLARE_UNREAD
+    return None
 
 
 def _now() -> str:
@@ -1049,7 +1294,7 @@ def build_provenance(
         # say. A press the reader could not read at all disagrees with
         # nothing in particular, and writing three empty containers
         # beside the attestation said "we looked and found nothing"
-        # three times in a row. Each of the three appears only when it
+        # three times in a row. Each of them appears only when it
         # carries something.
         note: dict[str, Any] = {"user_attested": True}
         reads_as = dict(disagreed.get("reads_as") or {})
@@ -1061,8 +1306,198 @@ def build_provenance(
             note["claims"] = claims
         if mismatches:
             note["mismatches"] = mismatches
+        # A press the map could not read at all has no claim or reading
+        # to record, but WHY it could not is what there was to say, and
+        # what a decoder made of it tells a foreign remote from the
+        # family's own press the map's windows missed. Keyed on the
+        # gate's own predicate, so the record says a reading failed
+        # exactly where the refusal did and nowhere else.
+        if (declaration_needed(lattice, row.target, disagreed)
+                == DECLARE_UNREAD and disagreed.get("declined")):
+            note["declined"] = disagreed["declined"]
+            decoded = disagreed.get("decoded") or {}
+            if decoded.get("protocol"):
+                note["decoded_as"] = decoded["protocol"]
+        # A field the map places by its own coordinate (a DAIKIN216
+        # vane, DAIKIN152's powerful flag) is compared but never named,
+        # so it has no claim or reading label above. Its raw values are
+        # what the reading said, and without them an override of it
+        # would record the field's name and nothing a re-ratification
+        # could count.
+        raw_read = dict(disagreed.get("raw_read") or {})
+        raw_expected = dict(disagreed.get("raw_expected") or {})
+        values = {
+            name: {"expected": raw_expected[name], "read": raw_read[name]}
+            for name in mismatches
+            if name not in claims
+            and name in raw_expected and name in raw_read
+        }
+        if values:
+            note["values"] = values
         record["reading_disagreed"] = note
     return record
+
+
+#: The two power codes a matrix carries, by the key the listing and
+#: every door name them with.
+POWER_KEYS = ("off", "on")
+
+#: Where a power code's repair record lives: on the MATRIX, under an
+#: unknown key, because ``off`` and ``on`` are plain strings on the
+#: block and have no extras bag of their own. Rides the matrix file and
+#: the exported wig by the same contract a cell's record does.
+POWER_RECORD_KEY = "hair_power_repair"
+
+
+class PowerHolder:
+    """A matrix power code, dressed as a holder (owner bench 2026-09-23).
+
+    A repair reads and writes its target through three things: the bytes
+    (``pronto``), the record beside them (``extra``), and nothing else.
+    A cell has both; a command has both under different names; ``off``
+    and ``on`` are bare strings on the climate block, so before this
+    every door that resolved a target went looking for them among
+    ``matrix.cells``, found nothing, and answered "That cell is gone" --
+    which is what the owner hit trying to capture a Fujitsu's Off.
+
+    Rather than nine special cases, the power code gets the same shape
+    the other two have. Reading ``pronto`` reads the matrix; writing it
+    writes the matrix; the record lands in ``matrix.extra`` under
+    ``hair_power_repair``, keyed by ``off`` / ``on``. Every repair
+    helper in this module then works on it unchanged, and so does every
+    door, because they all go through ``resolve_holder`` below.
+
+    It is deliberately NOT a dataclass with a copy of the bytes: a
+    snapshot would drift the moment anything else wrote the matrix, and
+    the whole point is that this IS the matrix.
+    """
+
+    __slots__ = ("key", "matrix")
+
+    def __init__(self, matrix: ClimateMatrix, key: str) -> None:
+        self.matrix = matrix
+        self.key = key
+
+    @property
+    def pronto(self) -> str:
+        code = self.matrix.off if self.key == "off" else self.matrix.on
+        return code or ""
+
+    @pronto.setter
+    def pronto(self, value: str) -> None:
+        if self.key == "off":
+            self.matrix.off = value
+        else:
+            self.matrix.on = value
+
+    @property
+    def extra(self) -> dict[str, Any]:
+        records = self.matrix.extra.setdefault(POWER_RECORD_KEY, {})
+        if not isinstance(records, dict):
+            records = {}
+            self.matrix.extra[POWER_RECORD_KEY] = records
+        bag = records.setdefault(self.key, {})
+        if not isinstance(bag, dict):
+            bag = {}
+            records[self.key] = bag
+        return bag
+
+    def tidy(self) -> None:
+        """Drop an emptied record so a reverted matrix serializes as it
+        did before anything was ever repaired."""
+        records = self.matrix.extra.get(POWER_RECORD_KEY)
+        if not isinstance(records, dict):
+            return
+        if not records.get(self.key):
+            records.pop(self.key, None)
+        if not records:
+            self.matrix.extra.pop(POWER_RECORD_KEY, None)
+
+    def __eq__(self, other: Any) -> bool:
+        return (
+            isinstance(other, PowerHolder)
+            and other.matrix is self.matrix
+            and other.key == self.key
+        )
+
+    def __hash__(self) -> int:
+        return hash((id(self.matrix), self.key))
+
+
+def is_power_key(key: Any) -> bool:
+    """Is this target key one of the matrix's power codes?"""
+    return key in POWER_KEYS
+
+
+def power_word(key: str) -> str:
+    """What a person must read about a power code: "Off", never "cell"."""
+    return "On" if key == "on" else "Off"
+
+
+def resolve_holder(
+    device: IRDevice, matrix: ClimateMatrix | None, kind: str, key: str
+) -> Any | None:
+    """The one thing that carries a target's bytes, or None if it is gone.
+
+    THE SINGLE ANSWER every door asks for (owner bench 2026-09-23). A
+    cell row resolves to its cell, a power row to a ``PowerHolder`` over
+    the matrix, a flat row to its command. Before this each door open-
+    coded the cell lookup and none of them knew about power, so half the
+    fix flow was unreachable for ``off`` and ``on``.
+    """
+    if kind != TARGET_CELL:
+        return device.get_command(key)
+    if matrix is None:
+        return None
+    if is_power_key(key):
+        holder = PowerHolder(matrix, key)
+        return holder if holder.pronto else None
+    return next(
+        (c for c in matrix.cells if cell_key(c) == key), None
+    )
+
+
+def holders_for_target(
+    device: IRDevice,
+    matrix: ClimateMatrix | None,
+    kind: str,
+    key: str,
+    coordinates: dict[str, Any] | None = None,
+) -> list:
+    """Everything a write to this target has to reach: the holder, plus
+    the portholes standing for it. A power code has no portholes -- the
+    comb only mints them over lattice cells -- so it is always alone."""
+    holder = resolve_holder(device, matrix, kind, key)
+    if holder is None:
+        return []
+    if kind != TARGET_CELL or is_power_key(key):
+        return [holder]
+    return [holder, *portholes_for(device, coordinates or {})]
+
+
+def record_holders(device: IRDevice, matrix: ClimateMatrix | None) -> list:
+    """Every holder on this device that can be carrying a repair record:
+    the lattice cells, the two power codes, and the commands. What a
+    run-wide undo has to look through."""
+    holders: list = list(matrix.cells if matrix else [])
+    if matrix is not None:
+        holders += [
+            holder for holder in
+            (PowerHolder(matrix, key) for key in POWER_KEYS)
+            if holder.pronto
+        ]
+    return holders + list(device.commands)
+
+
+def target_is_gone(kind: str, key: str) -> str:
+    """The refusal for a target that is not there any more, in the words
+    of the thing it names. A person must never read "cell" about a power
+    code (owner bench 2026-09-23)."""
+    if kind == TARGET_CELL and is_power_key(key):
+        return f"The {power_word(key)} code is gone"
+    if kind == TARGET_CELL:
+        return "That cell is gone"
+    return "That command is gone"
 
 
 def repair_extras(holder: Any) -> dict[str, Any]:
@@ -1093,6 +1528,9 @@ def restore_holder(
     bag = repair_extras(holder)
     bag.clear()
     bag.update(extras)
+    tidy = getattr(holder, "tidy", None)
+    if tidy is not None:
+        tidy()
 
 
 _extras_of = repair_extras
@@ -1139,6 +1577,12 @@ def revert_repair(holder: Any) -> dict[str, Any] | None:
     else:
         holder.pronto = prior
     _extras_of(holder).pop(PROVENANCE_KEY, None)
+    # A power code's record lives on the matrix, so an emptied one has
+    # to be swept up: the block would otherwise serialize with a stray
+    # ``hair_power_repair: {"off": {}}`` after an undo.
+    tidy = getattr(holder, "tidy", None)
+    if tidy is not None:
+        tidy()
     return record
 
 
@@ -1154,6 +1598,11 @@ def holders_for_rows(device: IRDevice, rows: list) -> list:
     wanted_cells: set = set()
     wanted_ids: set = set()
     for row in rows:
+        if row.target.kind == TARGET_CELL and is_power_key(row.target.key):
+            # No porthole is ever minted over a power code, and its
+            # coordinates carry no mode, so a coordinate lookup here
+            # would collide with any porthole that has none either.
+            continue
         if row.target.kind == TARGET_CELL:
             wanted_cells.add(_coord_key(row.target.coordinates))
         elif row.target.command_id:
@@ -1371,15 +1820,8 @@ def written_digest(
     which is the only way the two can be relied on to agree.
     """
     if row.target.kind == TARGET_CELL:
-        if matrix is None:
-            return None
-        if row.target.key in ("off", "on"):
-            pronto = matrix.off if row.target.key == "off" else matrix.on
-            return None if not pronto else _cell_digest(pronto)
-        cell = next(
-            (c for c in matrix.cells if cell_key(c) == row.target.key), None
-        )
-        return None if cell is None else _cell_digest(cell.pronto)
+        holder = resolve_holder(device, matrix, TARGET_CELL, row.target.key)
+        return None if holder is None else _cell_digest(repair_bytes(holder))
     wig, _sources = project_device(device, matrix)
     if wig is None:
         return None
@@ -1641,6 +2083,11 @@ SYNTH_RULE_PROVISIONAL = "integrity-rule-not-ratified"
 #: The capture does not read as the value the cluster needs. Nothing is
 #: witnessed, so nothing is synthesized.
 SYNTH_NO_WITNESS = "capture-does-not-read-as-needed"
+#: A candidate breaks a rule the map vouches for, so the unit would
+#: reject it. A captured press that does is declined on its own row; a
+#: built one refuses the whole run, because the arithmetic behind every
+#: other built cell is the same.
+SYNTH_RULE_FAILS = "integrity-rule-fails"
 #: This cell has no healthy relative to build from.
 SYNTH_NO_SIBLING = "no-healthy-sibling"
 #: Nothing read the lattice, or the sibling's own bytes will not parse.
@@ -1670,6 +2117,9 @@ TRIM_READS_WRONG = "trimmed-bytes-read-wrong"
 #: every pair as once-only. Trimming would have to rewrite the sequence
 #: split, which is a re-encode and not a deletion.
 TRIM_HAS_REPEAT_SEQUENCE = "code-has-repeat-sequence"
+#: The map that reads this lattice does not read the trimmed bytes at
+#: all. Not "read wrong": there is no reading to be wrong.
+TRIM_UNREAD = "trimmed-bytes-unread"
 
 
 class SynthesisBug(RuntimeError):
@@ -1805,8 +2255,12 @@ def _repair_integrity(
                 if last >= len(frame):
                     continue
                 modulus = int(params.get("mod", 256) or 256)
+                # ``scale`` as check_integrity reads it: +1 unless the
+                # map says otherwise, -1 for a check byte that is a
+                # constant MINUS the sum (FUJITSU128).
+                scale = int(params.get("scale", 1) or 1)
                 total = (
-                    sum(frame[first:last + 1])
+                    scale * sum(frame[first:last + 1])
                     + int(params.get("offset", 0) or 0)
                 ) % modulus % 256
             else:
@@ -1859,7 +2313,9 @@ def rewrite_field(
     member of the family it came from rather than an idealised drawing
     of one.
 
-    Returns None when the capture will not parse under the map.
+    Returns None when the capture will not parse under the map, or when
+    the field's bits cannot carry ``value`` (masking it in would write
+    some other value and call it this one).
     """
     words = _pronto_words(pronto)
     if words is None:
@@ -1870,11 +2326,24 @@ def rewrite_field(
     frames, positions, unreadable = field_readers.read_frames_positioned(
         field_map.timing, timings
     )
-    if unreadable or spec.frame >= len(frames):
+    if unreadable:
+        return None
+    # Laid on the map's layout, the way the reader lays them. A capture
+    # that left out an optional leader (schema v0.6) gets an empty frame
+    # 0 with no positions, so ``spec.frame`` names the same frame in both
+    # forms and nothing in the stand-in is ever rewritten. A capture the
+    # layout does not fit is walked exactly as it was before alignment
+    # existed, so no other family's behaviour moves.
+    laid = field_readers.aligned_positioned(field_map, frames, positions)
+    if laid is not None:
+        frames, positions = laid
+    if spec.frame >= len(frames):
         return None
     try:
         mask, shift = field_readers.bit_selector(spec.bits)
     except ValueError:
+        return None
+    if not field_readers.fits(spec, value):
         return None
 
     before = [
@@ -1921,21 +2390,54 @@ def _healthy_siblings(
     A sibling that is itself lying would carry its lie into every cell
     built from it, so the check is not "same coordinates" but "same
     coordinates AND telling the truth".
+
+    TRUTH IS JUDGED WHERE THE BUILT CODE WILL LIVE. A field the map
+    says carries nothing at the sibling is still copied into the code
+    built from it, and if that field matters at the target the copy is
+    what the target will send. So a field is let off only when it
+    applies at NEITHER cell. A dry sibling is healthy for a dry target
+    whatever its forced fan bits hold, and is not healthy for a cool
+    target: its frozen temperature byte would be built into a cool code.
     """
-    axis = FIELD_COORDINATE.get(field_name)
+    rewritten = lattice.spec_for(field_name)
+    axis = (_axis_of(rewritten) if rewritten is not None
+            else FIELD_COORDINATE.get(field_name))
     if axis is None:
         return []
-    anchor = _elsewhere(target, {field_name})
+    anchor = _elsewhere(target, {axis})
+    mode_spec = lattice.field_map.field_named("mode")
+    applies_at_target = {
+        spec.name: field_readers.field_skip_reason(
+            spec, mode_spec, _cell_coords(target)) is None
+        for spec in lattice.field_map.fields
+    }
     out = []
     for key, candidate in lattice.cells.items():
-        if candidate is target or _elsewhere(candidate, {field_name}) != anchor:
+        if candidate is target or _elsewhere(candidate, {axis}) != anchor:
             continue
+        here = _cell_coords(candidate)
         healthy = True
         for spec in lattice.field_map.fields:
-            if not spec.ratified:
+            # Only the rewritten field is rewritten. Another field on the
+            # same axis (a flag beside DAIKIN152's fan speed) rides into
+            # the built code exactly as the sibling sends it, so it is
+            # judged against the TARGET's label wherever it applies
+            # there, provisional or not -- the rule the donor search
+            # holds such a field to. Judged against the sibling's own
+            # label, a powerful sibling is healthy and builds a low code
+            # that sends powerful.
+            rides = (spec.name != field_name and _axis_of(spec) == axis
+                     and applies_at_target[spec.name])
+            if not spec.ratified and not rides:
                 continue
-            claimed = _coordinate_of(candidate, spec.name)
+            claimed = _coordinate_of(
+                target if rides else candidate, spec.name, lattice)
             if claimed is None:
+                continue
+            if (spec.name != POWER_FIELD
+                    and not applies_at_target[spec.name]
+                    and field_readers.field_skip_reason(
+                        spec, mode_spec, here) is not None):
                 continue
             expected = field_readers.expected_value(spec, claimed)
             read = lattice.reads(key, spec)
@@ -1948,16 +2450,34 @@ def _healthy_siblings(
             out.append(candidate)
     # Nearest on the rewritten axis first, then by key, so the choice is
     # deterministic and a card built twice is built the same way.
-    target_value = _coordinate_of(target, field_name)
+    target_value = _coordinate_of(target, field_name, lattice)
 
     def _distance(cell: ClimateCell) -> tuple:
-        value = _coordinate_of(cell, field_name)
+        value = _coordinate_of(cell, field_name, lattice)
         if isinstance(value, int | float) and isinstance(
                 target_value, int | float):
             return (abs(float(value) - float(target_value)), cell_key(cell))
         return (0.0, cell_key(cell))
 
     return sorted(out, key=_distance)
+
+
+def _breaks_a_ratified_rule(field_map: Any, pronto: str) -> bool:
+    """True when a rule the map vouches for is violated in ``pronto``.
+
+    Only a definite False counts. A rule that cannot be evaluated on
+    this frame is left to the read-back, as it was before.
+    """
+    reading = field_readers.read_code(
+        pronto, [field_map], prefer=field_map.protocol_id
+    )
+    if not reading.identified:
+        return False
+    return any(
+        field_readers.check_integrity(reading, rule) is False
+        for rule in field_map.integrity
+        if rule.ratified
+    )
 
 
 def synthesize(
@@ -2075,8 +2595,19 @@ def synthesize(
         if verdict.matches is not True:
             raise SynthesisBug(
                 f"synthesized candidate for {row.target.key} reads as "
-                f"{verdict.reads_as} against {verdict.claims}"
+                f"{verdict.reads_as} against {verdict.claims}, "
+                f"mismatched on {verdict.mismatches} (read "
+                f"{verdict.raw_read} against {verdict.raw_expected})"
             )
+        if _breaks_a_ratified_rule(field_map, built):
+            # The read-back above checks fields only. A bad capture is
+            # the user's press: its row is declined and the cells built
+            # from their own siblings stand, as they would had the press
+            # not been aimed. A bad built cell is refused, not raised.
+            if origin == ORIGIN_CAPTURE:
+                result.declined[row.id] = SYNTH_RULE_FAILS
+                continue
+            return Synthesis(refused=SYNTH_RULE_FAILS)
         result.candidates[row.id] = {
             "pronto": built,
             "digest": _cell_digest(built),
@@ -2265,6 +2796,18 @@ def _label_for(spec: Any, domain: list[Any], value: int) -> Any:
     return None
 
 
+def _comb_byte(text: Any) -> int | None:
+    """A byte value as the comb wrote it ("0x1A"), or None when the text
+    is not one. Both readers of a finding's ``expected`` and ``read`` go
+    through here, so a value the comb should never have written costs a
+    label rather than the whole listing."""
+    try:
+        value = int(str(text), 16)
+    except ValueError:
+        return None
+    return value if 0 <= value <= 0xFF else None
+
+
 def _stamp_mismatch_labels(
     rows: list[TangleRow], lattice: LatticeReading
 ) -> None:
@@ -2293,8 +2836,11 @@ def _stamp_mismatch_labels(
             if spec is None or expected is None or read is None:
                 continue
             domain = _axis_domain(lattice, name)
-            claimed = _label_for(spec, domain, int(str(expected), 16))
-            actual = _label_for(spec, domain, int(str(read), 16))
+            claimed_byte, read_byte = _comb_byte(expected), _comb_byte(read)
+            if claimed_byte is None or read_byte is None:
+                continue
+            claimed = _label_for(spec, domain, claimed_byte)
+            actual = _label_for(spec, domain, read_byte)
             if claimed is not None:
                 params["claimed"] = claimed
             if actual is not None:
@@ -2378,10 +2924,11 @@ def _cause_of(
         )
         expected, read = params.get("expected"), params.get("read")
         spec = lattice.spec_for(name) if name else None
-        if spec is not None and expected is not None and read is not None:
+        if (spec is not None and _comb_byte(expected) is not None
+                and _comb_byte(read) is not None):
             domain = _axis_domain(lattice, name)
-            claimed = _label_for(spec, domain, int(str(expected), 16))
-            actual = _label_for(spec, domain, int(str(read), 16))
+            claimed = _label_for(spec, domain, _comb_byte(expected))
+            actual = _label_for(spec, domain, _comb_byte(read))
             step = _ring_step(
                 _ring_domain(lattice, name), claimed, actual)
             if step is not None:
@@ -2436,10 +2983,20 @@ def _mechanic(row: TangleRow, lattice: LatticeReading) -> str:
         row.target.kind == TARGET_CELL
         and row.donor_abstain == ABSTAIN_NO_READING
         and lattice.readable
+        and all(name in FIELD_COORDINATE or name == POWER_FIELD
+                for name in _mismatched_fields(row.findings))
     ):
         # The search reached the end of a readable lattice on a field
         # the map vouches for and found nothing. That is exactly the
         # case a witnessed capture answers.
+        #
+        # Only for a field the card can aim. The card matches a press to
+        # its target through its own mirror of the name table, and a
+        # field the map places by its own coordinate (DAIKIN216's vanes,
+        # DAIKIN152's powerful) is not in it, so a witness card on one
+        # could never accept the right press. The road could not build
+        # one either: it rewrites one field of an axis other fields
+        # answer too. Such a row is asked for a fresh capture instead.
         return MECHANIC_WITNESS
     return MECHANIC_RECAPTURE
 

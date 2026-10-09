@@ -218,8 +218,11 @@ def test_the_corpus_is_the_one_the_measurement_was_taken_on():
     external side since the ARC486A1 field capture landed (2026-09-12),
     and 924 on the JSON side since the import phase 1 adapter fixtures
     landed: those files carry one code per cell, as a real state matrix
-    does, and every one of them ends in a real trailing gap."""
-    assert len(JSON_CORPUS) == 924
+    does, and every one of them ends in a real trailing gap. 927 since
+    the thinning corpus pin landed (fixtures/thinning, WigShop PR #19's
+    after file): its 834 cells are the Komeco fixture's own codes except
+    four repaired ones, three of them new to the tree."""
+    assert len(JSON_CORPUS) == 927
     assert len(EXT_CORPUS) == 80
 
 
@@ -330,14 +333,16 @@ def test_only_the_tail_class_moves():
         if _legacy_byte_hash(c) == EventParser.pronto_byte_hash(c)
     ]
 
-    assert len(moved) == 841
+    # 841 until the thinning corpus pin's three new codes, all
+    # zero-tailed like the Komeco codes they replaced.
+    assert len(moved) == 844
     # 12 at v0.12.0, plus the 71 gap-tailed codes the phase 1 adapter
     # fixtures added. A gap tail is exactly the class that must not
     # move, so the new codes land on the holding side by construction.
     assert len(still) == 83
     assert {_tail_class(c) for c in still} == {"gap"}
     assert sorted(_tail_class(c) for c in set(moved)) == (
-        sorted(["zero"] * 838 + ["sub"] * 3)
+        sorted(["zero"] * 841 + ["sub"] * 3)
     )
     # Every mover lands on the value canonicalization already computed:
     # the two layers converge, they do not both drift somewhere new.
@@ -346,13 +351,44 @@ def test_only_the_tail_class_moves():
 
 
 def test_the_extended_corpus_moves_seven():
-    """The mirror of A4/A5 on the gap-tailed corpus: 7 move, 72 hold."""
+    """The mirror of A4/A5 on the gap-tailed corpus: 7 move, 72 hold.
+
+    ONE MOVER IS NOT A TAIL MOVER (2026-09-29). Setting-frame identity
+    computes an allowlisted family's hash on the frames that carry the
+    settings, and this corpus holds one real DAIKIN152 code, which
+    therefore moves for a reason that has nothing to do with the tail.
+    It is separated out rather than folded into the count, because the
+    count is what pins the tail strip and conflating the two would
+    retire that guarantee quietly.
+
+    MITSUBISHI144 joined the setting-frame list later (2026-10-02), and
+    the corpus holds 35 of its codes, all gap-tailed, which move onto
+    the setting path the same way. The tail movers are still seven.
+    """
+    from collections import Counter
+
+    from custom_components.hair.field_readers import read_code
+    from custom_components.hair.identity import setting_frame_spans
+
+    def on_setting_path(code):
+        words = EventParser._parse_pronto_words(code)
+        if words is None:
+            return False
+        return setting_frame_spans(EventParser._pronto_us(words)) is not None
+
     moved = [
         c for c in EXT_CORPUS
         if _legacy_byte_hash(c) != EventParser.pronto_byte_hash(c)
     ]
-    assert len(moved) == 7
-    assert {_tail_class(c) for c in moved} == {"sub", "zero"}
+    setting_movers = [c for c in moved if on_setting_path(c)]
+    tail_movers = [c for c in moved if not on_setting_path(c)]
+
+    assert Counter(
+        read_code(c).protocol_id for c in setting_movers
+    ) == {"DAIKIN152": 1, "MITSUBISHI144": 35}
+    assert {_tail_class(c) for c in setting_movers} == {"gap"}
+    assert len(tail_movers) == 7
+    assert {_tail_class(c) for c in tail_movers} == {"sub", "zero"}
 
 
 def test_device_fingerprint_does_not_move():
@@ -368,14 +404,22 @@ def test_device_fingerprint_does_not_move():
 
 def test_the_strip_removes_at_most_one_character():
     """Why A6 holds rather than happening to hold. One tail word, so one
-    S/L character, against a shortest corpus pattern of 23."""
+    S/L character, against a shortest corpus pattern of 23.
+
+    Measured on the PREAMBLE walk, which is the one A6 is about: since
+    2026-09-29 ``_pronto_sl_pattern`` reads an allowlisted family's
+    setting frames, which is a different question and can lengthen a
+    pattern by a whole frame. ``device_fingerprint`` reads the walk
+    below, so this is what has to hold for it.
+    """
     deltas = set()
     shortest = min(
-        len(EventParser._pronto_sl_pattern(c) or "") for c in UNION_CORPUS
+        len(EventParser._pronto_preamble_sl_pattern(c) or "")
+        for c in UNION_CORPUS
     )
     for code in UNION_CORPUS:
         before = len(_legacy_sl_pattern(code) or "")
-        after = len(EventParser._pronto_sl_pattern(code) or "")
+        after = len(EventParser._pronto_preamble_sl_pattern(code) or "")
         deltas.add(before - after)
     assert deltas <= {0, 1}
     assert shortest > PRONTO_NEC_ADDRESS_PAIRS * 2 + 2

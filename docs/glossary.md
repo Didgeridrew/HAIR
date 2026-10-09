@@ -242,6 +242,14 @@ command. An AC Remote shows the same card for listening.
 the top of the card holds the off code and, when the file has one, a separate
 on code.
 
+**Thinning.** Removing the states your unit does not have, from the pencil on
+the STATE MATRIX card. The card calls it trimming, and its summary line says
+what the trim cost ("trimmed from 143 to 77"). You can remove a value on an
+axis, a whole mode, a whole preset lattice, or the separate on code. Saving
+makes a new wig beside the original, which stays in the closet as the undo.
+Thinning is for things that do not exist; exclusion on the fitting checklist
+is for things you could not make work.
+
 **STATE chip.** The small marker on a command or trigger that was saved out
 of the STATE MATRIX card, so you can tell it apart from a learned button.
 
@@ -296,9 +304,11 @@ the Mirror to what you are chasing.
 **Power sensor.** Any Device that plausibly draws current can be pointed at a
 power reading, such as a smart plug's wattage. Set two thresholds and the
 Device counts as off at or below the lower one and on at or above the higher
-one. A reading that crosses a threshold overrides what HAIR assumed from the
+one. A reading past either threshold overrides what HAIR assumed from the
 last command sent, so a device switched off with its original remote stops
-claiming to be on.
+claiming to be on. After each HAIR send the sensor waits out a settle time
+(20 seconds by default, 0 for none) before it can overrule the command, so
+a plug that has not reported the new draw yet cannot flip the device back.
 
 **Room sensors.** On a state-matrix climate Device, a temperature sensor, a
 humidity sensor, or both, shown live under the thermostat card. Display only.
@@ -361,6 +371,12 @@ comb found in its wig, one row per code with a plain reason. Every card has one
 **Fix** button. Some fixes are ready to accept, some need a press from your
 remote, and some ask you to choose between two buttons that share a name.
 
+**Unusual.** The Needs attention card for codes that look odd rather than
+wrong, such as a code whose frames are shaped differently from the rest of
+the remote. Send the code, and if your device responds, **It Works, Keep It**
+records that answer. The button stays off until you have sent that code.
+Unusual codes do not hold up a Perfect Fit.
+
 **Repaired.** The chip on a command whose code was fixed from Needs attention.
 The fix is saved to your Closet as a repaired copy of the wig; the original
 file is never changed.
@@ -380,7 +396,8 @@ it leaves, which travels with the file from then on. You run one from **Save
 to Closet**, **Fit This Wig**, and hit **TEST** on each row of the checklist.
 A fitting of any size is saved: check the rows you proved and the save reads
 **Save Fitting**, check none and it is a plain **Save**. A fitting waits until
-the Device's Needs attention block is empty.
+the Device's Needs attention block is empty, apart from codes on the Unusual
+card.
 
 **Perfect Fit.** A fitting that covers every row: every row of a flat wig
 checked, or every dimension of a state-matrix wig, across every lattice it

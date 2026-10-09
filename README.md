@@ -63,6 +63,8 @@ These integrations have adopted the `infrared` platform:
 
 Pluck reads codes an integration has already stored in Home Assistant. For Broadlink that means codes learned with `remote.learn_command`: a blaster you have only ever transmitted through has nothing to pluck yet, and codes learned in the Broadlink phone app stay in Broadlink's cloud and never reach Home Assistant. This applies to every RM model Home Assistant supports, not only the newer ones.
 
+Coming from [OpenIRBlaster](https://github.com/jaycollett/OpenIRBlaster)? The Plucker reads the code library it learned, with the carrier it measured for each code, so you do not have to learn your remotes again. From OpenIRBlaster 1.3.2 the library stays in Home Assistant after the integration is removed. On 1.3.1 and earlier, removing it deletes the library, so pluck first.
+
 As more integrations adopt the `infrared` platform, HAIR picks them up automatically.
 
 ## Quick start
@@ -266,7 +268,7 @@ Spacing is exact on ESPHome and Broadlink emitters, which accept the whole burst
 
 ### Device settings and power sensing
 
-IR devices are send-only, so HAIR normally has to assume a command landed. Any device that plausibly draws current (AC, media player, fan, light, switch) shows a small settings button beside its emitter picker; open it to point a power sensor at the device, such as a smart plug's wattage reading. Set two thresholds, and the device counts as off at or below the lower one and on at or above the higher one, with a live reading shown once a sensor is picked. Readings that cross a threshold override what HAIR assumed from the last command sent, and keep doing so across a Home Assistant restart, so a device switched off with its original remote stops claiming to be on. Devices without a sensor still restore their last-known state after a restart instead of resetting to blank.
+IR devices are send-only, so HAIR normally has to assume a command landed. Any device that plausibly draws current (AC, media player, fan, light, switch) shows a small settings button beside its emitter picker; open it to point a power sensor at the device, such as a smart plug's wattage reading. Set two thresholds, and the device counts as off at or below the lower one and on at or above the higher one, with a live reading shown once a sensor is picked. Readings past either threshold override what HAIR assumed from the last command sent, and keep doing so across a Home Assistant restart, so a device switched off with its original remote stops claiming to be on. After each command HAIR sends, the sensor gets a settle time (20 seconds unless set otherwise in the same settings, 0 turns it off) so a plug that has not yet reported the new draw cannot flip the device back; if the device never responded, the sensor still corrects it after the settle time, with the plug's first report after the command. Devices without a sensor still restore their last-known state after a restart instead of resetting to blank.
 
 On a state-matrix climate device the same dialog also takes a temperature sensor, a humidity sensor, or both, and the thermostat card shows a live reading under each. Display only, and a sensor reporting in a different unit than your installation converts automatically.
 
@@ -309,7 +311,7 @@ infrared:
 
 Reflash, and the Devices tab shows the emitter with a `TX-NATIVE` badge and the receiver with `RX-NATIVE`.
 
-For ready-made configs for common ESP32 boards (XIAO Smart IR Mate, Athom RF IR Remote, M5Stack IR Unit, generic ESP32s), see [`esphome/`](esphome/) in this repo.
+For ready-made configs for common ESP32 boards (XIAO Smart IR Mate, Athom RF IR Remote, M5Stack IR Unit, generic ESP32s), see [`esphome/`](esphome/) in this repo. Not sure what to buy? [Recommended IR hardware](docs/recommended-hardware.md) compares them, with prices and where to buy.
 
 <details>
 <summary><b>Starting from scratch? The complete minimal YAML (TX + RX + registration)</b></summary>
@@ -326,14 +328,17 @@ remote_transmitter:
 remote_receiver:
   id: ir_rx
   pin:
-    number: GPIO8   # your IR receiver data pin
-    inverted: true
+    number: GPIO8           # your IR receiver data pin
+    inverted: true          # most receiver modules idle high; flip this if nothing ever decodes
     mode:
       input: true
       pullup: true
-  dump: all
+  clock_resolution: 400000  # 2.5us ticks; exact conversion, and it keeps the RMT divider legal on every ESP32
+  idle: 80ms                # silence that ends a capture; clears every air-conditioner gap we know (Daikin ~35ms); 82ms is the cap on C3/S3
+  receive_symbols: 384      # room for the longest press HAIR reads (Daikin 152, 293 pairs); ESPHome's default 192 cuts it
+  # rmt_symbols: 384        # original ESP32 only: uncomment there; leave it out on the C3 and S3
   tolerance: 25%
-  idle: 100ms
+  dump: all                 # chatty; remove once things work
 
 # --- Register both on HA's native infrared platform ---
 infrared:
@@ -354,32 +359,9 @@ infrared:
 
 The `idle` value above is how much silence ends a capture. ESPHome's own default is 10 ms, and that is shorter than the gaps inside a single air conditioner message: a Daikin press carries about 35 ms of silence in the middle of it. At 10 ms the receiver closes the capture in those gaps, so one press arrives as several codes, and because each piece looks like a different signal it can show up as several remotes in the Sniffer.
 
-100 ms is the value to use. It is field-proven on the units in this folder and it comfortably clears the longest in-message gap those protocols use. The trade-off at very high values is the opposite problem: hold a button down and the repeats start merging into one capture instead of arriving as separate presses. HAIR's decoders split a merged capture back into frames per protocol, and 100 ms is well inside the range where that works, so it is a safe place to sit.
+80 ms is the value to use, with `clock_resolution: 400000` beside it. The ESP32's receiver counts silence in clock ticks and caps the count, which at ESPHome's default clock is about 32 ms on the C3 and S3 and 65 ms on the original ESP32, so a larger `idle` on its own fails validation with `config 'idle' exceeds the maximum value of 32767us`. The slower clock raises that ceiling to 82 ms on the C3 and S3 while keeping timings exact on every ESP32 chip, and 80 ms under it still clears the Daikin gap by more than double. The trade-off at high values is the opposite problem: hold a button down and the repeats start merging into one capture instead of arriving as separate presses. HAIR's decoders split a merged capture back into frames per protocol, so this is a safe place to sit. Why these two numbers, and the alternatives if your remotes need something else, are in [Receiver timing](docs/receiver-timing.md).
 
-<details>
-<summary>Legacy bridge for HA 2026.4-2026.5 (only if you cannot upgrade)</summary>
-
-Before native `InfraredReceiverEntity` shipped in HA 2026.6, HAIR received signals over an event-bus bridge. If you are stuck on 2026.4 or 2026.5, add this to your ESPHome device's `remote_receiver` block:
-
-```yaml
-remote_receiver:
-  id: ir_receiver
-  pin:
-    number: GPIO5   # your IR receiver data pin
-    inverted: true
-  dump: pronto
-  on_pronto:
-    then:
-      - homeassistant.event:
-          event: esphome.remote_received
-          data:
-            protocol: "PRONTO"
-            code: !lambda 'return x.data;'
-```
-
-This fires every IR signal as a `homeassistant.event` on the HA bus, and the HAIR Sniffer subscribes automatically. The panel shows `RX-BRIDGE` on the receiver card while this path is in use. When you upgrade to 2026.6+, add the `infrared` platform receiver entry above and reflash; HAIR switches over automatically, and you can remove the `on_pronto:` block once `RX-NATIVE` appears.
-
-</details>
+The receiver also needs room for a whole press. A Daikin 152 press is 293 mark-and-space pairs and a Mitsubishi Electric one 292, while ESPHome keeps 192 by default, so the capture stops partway and the press never reaches HAIR whole. `receive_symbols: 384` fixes that on the C3 and S3. On the original ESP32 the capture also ends when the receiver's share of the RMT memory fills, so it needs `rmt_symbols: 384` as well, and that memory is shared with every transmitter and receiver on the board: on a board that also has a 433 MHz receiver, [Receiver timing](docs/receiver-timing.md) shows how to split it.
 
 ### Translations
 

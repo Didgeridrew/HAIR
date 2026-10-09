@@ -83,6 +83,7 @@ import "./ir-tx-knobs.js";
 import "./ir-claims-ledger.js";
 import { ICON_WIG } from "./ir-wigs.js";
 import { ICON_COMB, COMB_VIEWBOX } from "./ir-icons.js";
+import { blockingCount } from "./ir-tangle-buckets.js";
 
 type Verdict = "worked" | "not_on_device" | "wont_work";
 
@@ -485,7 +486,10 @@ export class IrSavePerfectDialog extends LitElement {
             // modal, so nothing can settle a row while it is open.
             try {
                 const listing = await this.api.tangles(this.sourceId);
-                this._openTangles = listing.rows.length;
+                // Unusual rows do not hold the signing up (owner ruled
+                // 2026-09-27, GH #177); the server gate counts the same
+                // rows through tangles.blocking_rows.
+                this._openTangles = blockingCount(listing);
             } catch {
                 this._openTangles = 0;
             }
@@ -1423,6 +1427,7 @@ export class IrSavePerfectDialog extends LitElement {
                     `,
                 )}
                 <span class="reason-hint">${t("wigs.save.reason_hint")}</span>
+                <span class="reason-thin">${t("wigs.save.reason_thin")}</span>
             </div>
         `;
     }
@@ -1839,6 +1844,15 @@ export class IrSavePerfectDialog extends LitElement {
             }
             .reason-hint {
                 opacity: 0.75;
+            }
+            /* Where "my unit has no Turbo" actually goes (brief 10:
+               thinning is for things that do not exist; exclusion is
+               for things you could not make work). One sentence, on
+               its own line under the two reasons. */
+            .reason-thin {
+                flex-basis: 100%;
+                opacity: 0.75;
+                font-style: italic;
             }
             /* Perfect-or-nothing (owner ruling 2026-08-07): a neutral
                running count, not a warning -- attesting rows is the

@@ -455,6 +455,11 @@ DECLINE_TOO_FEW_CODES = "too-few-codes"
 DECLINE_NO_LATTICE = "no-lattice"
 DECLINE_ROW_TOO_SHORT = "row-too-short"
 DECLINE_NO_TEMPERATURE = "no-temperature"
+# A matrix's off and on are not state frames and are not judged against
+# them (owner bench 2026-09-23). Several families send power as a
+# shorter frame by design, so the lattice's modal shape says nothing
+# about whether a power code is well formed.
+DECLINE_POWER_CODE = "power-code"
 # A voting decoder already read the whole capture and accepted it, so
 # the raw frame differences this check would otherwise report are the
 # ones that decoder discarded on its way to a verdict. Declining is the
@@ -1016,23 +1021,27 @@ def _temperature_moves(
 def _skip_reason(
     spec: Any, mode_spec: Any, code: _Code, moves: dict[str, bool]
 ) -> str | None:
-    """Why this field is not comparable on this code, or None."""
+    """Why this field is not comparable on this code, or None.
+
+    The map's own reasons are ``field_readers.field_skip_reason``, which
+    the distinctness sweep shares; the comb adds the two that are its
+    alone, before and after it: a provisional field is coverage here,
+    and a temperature this wig never moves in a mode is frozen.
+    """
     if not spec.ratified:
         return field_readers.NOT_RATIFIED
-    if not field_readers.applies(spec, code.coordinates):
-        return field_readers.NOT_APPLICABLE
+    reason = field_readers.field_skip_reason(
+        spec, mode_spec, code.coordinates
+    )
+    if reason is not None:
+        return reason
     mode = code.coordinates.get("mode")
     if spec.name == "temperature" and mode_spec is not None:
         trait = field_readers.mode_trait(mode_spec, mode, "temp")
-        if trait == "invariant":
-            return field_readers.TEMP_INVARIANT
         # A mode the map never named is treated as file_dependent: the
         # map cannot vouch for it, so the wig's own behaviour decides.
         if trait != "varies" and not moves.get(mode or "", False):
             return field_readers.TEMP_FROZEN
-    if spec.name == "fan_speed" and mode_spec is not None \
-            and field_readers.mode_trait(mode_spec, mode, "fan") == "forced":
-        return field_readers.FAN_FORCED
     return None
 
 
@@ -1131,7 +1140,9 @@ def _field_findings(
                 continue
             expected = field_readers.expected_value(spec, coordinate)
             if expected is None:
-                coverage.field_declined(spec.name, field_readers.UNKNOWN_LABEL)
+                coverage.field_declined(
+                    spec.name,
+                    field_readers.uncomputable_reason(spec, coordinate))
                 continue
             value = field_readers.read_field(reading, spec)
             if value is None:
@@ -1220,11 +1231,24 @@ def _shape_findings(
     bi-phase encoding makes exact matching produce false positives on
     perfectly good buttons (see ``_outlier_findings``).
     """
+    # A leader the family's field map says a code may leave out (schema
+    # v0.6) is not part of the shape every code shares, but only a
+    # population that MIXES the two forms needs telling so. Left in there,
+    # every cell carrying the leader reads as a longer frame 0 (at the
+    # carriers measured its gap is short of the threshold, so it lands
+    # inside frame 0 rather than as a frame of its own). A population that
+    # does not mix is compared exactly as before, so a lattice whose codes
+    # all carry the leader keeps every finding it had, including those on
+    # codes no map can read.
+    leads = {key: field_readers.optional_leader_pairs(pronto)
+             for key, pronto in rows}
+    mixed = 0 in leads.values() and any(leads.values())
     shapes: dict[str, tuple[int, ...]] = {}
     for key, pronto in rows:
         pairs = _pairs(pronto)
         if pairs:
-            shapes[key] = _frame_lengths(pairs)
+            lead = leads[key] if mixed else None
+            shapes[key] = _frame_lengths(pairs[lead:] if lead else pairs)
         elif coverage is not None:
             coverage.declined(CHECK_FRAME_SHAPE, DECLINE_UNPARSEABLE)
     if len(shapes) < 3:
@@ -1561,18 +1585,35 @@ def comb_wig(wig: Wig) -> CombReport:
         # the buttons dragged into the lattice's modal shape, or into
         # its duplicate-label groups.
         cells = [(cell_key(c), c.pronto) for c in wig.climate.cells]
-        cells.append(("off", wig.climate.off))
+        # POWER CODES ARE NOT STATE FRAMES (owner bench 2026-09-23).
+        # They do not join the shape population, as judged or as
+        # voters, for exactly the reason the bypass block above gives:
+        # a code must not vote on what normal looks like for codes it
+        # is not like, and it must not be judged against a normal it
+        # was never part of. Several families send state as one frame
+        # width and power as another BY DESIGN -- Fujitsu's AR-RBE1E
+        # sends 16-byte state frames and a 7-byte power-off -- and the
+        # modal shape of a lattice is always the state frame, so every
+        # one of those devices had its own correct Off reported as
+        # malformed and its wig blocked from being fitted.
+        #
+        # Every other check that reads Off and On is untouched: the
+        # repeat check below still sees them, the coverage count still
+        # counts them, and ``_matrix_codes`` still hands them to the
+        # field tier with their power coordinate.
+        power = [("off", wig.climate.off)]
         if wig.climate.on is not None:
-            cells.append(("on", wig.climate.on))
+            power.append(("on", wig.climate.on))
         findings += _shape_findings(cells, strict=True, coverage=coverage)
+        coverage.declined(CHECK_FRAME_SHAPE, DECLINE_POWER_CODE, len(power))
         findings += _branch_findings(wig.climate, coverage)
         findings += _completeness_findings(wig.climate)
         findings += _coordinate_findings(wig.climate)
         # The repeat check needs no population, so it runs on the flat
         # extras too: a matrix wig's depth-0 buttons are captures like
         # any other and can be just as noisy.
-        coverage.codes = len(cells) + len(rows) + len(skipped)
-        findings += _repeat_findings(cells + rows, coverage)
+        coverage.codes = len(cells) + len(power) + len(rows) + len(skipped)
+        findings += _repeat_findings(cells + power + rows, coverage)
         # The field tier, on the lattice only: a flat row carries a
         # free-form name, not a coordinate, so there is nothing to check
         # its bytes against (design plan section 4).

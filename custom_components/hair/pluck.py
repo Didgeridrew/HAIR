@@ -19,6 +19,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
 from .const import PLUCK_TIMEOUT_S
+from .device_registry_compat import device_by_connection
 from .learned_code_stores import (
     PROVIDERS,
     PROVIDERS_BY_INTEGRATION,
@@ -296,10 +297,15 @@ def resolve_store_names(hass: HomeAssistant, infos: list[StoreInfo]) -> None:
     """Fill in each store's friendly name, in place.
 
     Two sources, cheapest first: the config entry whose unique_id is the
-    store id (true for both integrations -- Broadlink's is the MAC hex,
-    Tuya Local's is the entry unique_id the filename carries), then, for
-    Broadlink, the device registry entry reached through that MAC, which
-    is where a user-assigned name lives.
+    store id (true for both packet-map integrations -- Broadlink's is the
+    MAC hex, Tuya Local's is the entry unique_id the filename carries),
+    then, for Broadlink, the device registry entry reached through that
+    MAC, which is where a user-assigned name lives.
+
+    OpenIRBlaster's filename carries the config ENTRY ID, while its
+    unique_id is the device MAC, so the two never match. Its provider
+    row says ``name_hint="entry_id"`` and the lookup compares entry_id
+    for it instead; every other provider keeps the unique_id match.
 
     Defensive throughout: a store whose integration has since been
     removed still has codes worth plucking, and it simply keeps its id
@@ -313,18 +319,40 @@ def resolve_store_names(hass: HomeAssistant, infos: list[StoreInfo]) -> None:
 
     for info in infos:
         name = ""
+        # The entry that owns this store, when one is found below. The
+        # registry lookup needs it: a connection is unique inside one
+        # config entry, and this device belongs to the provider
+        # integration's entry, never to HAIR's.
+        store_entry_id: str | None = None
+        provider = PROVIDERS_BY_INTEGRATION.get(info.integration)
+        key_attr = (
+            "entry_id"
+            if provider is not None and provider.name_hint == "entry_id"
+            else "unique_id"
+        )
         try:
             for entry in hass.config_entries.async_entries(info.integration):
-                if (getattr(entry, "unique_id", None) or "") == info.store_id:
+                if (getattr(entry, key_attr, None) or "") == info.store_id:
                     name = (getattr(entry, "title", "") or "").strip()
+                    entry_id = getattr(entry, "entry_id", None)
+                    if isinstance(entry_id, str) and entry_id:
+                        store_entry_id = entry_id
                     break
         except Exception:
             name = ""
         mac = _mac_with_colons(info.store_id)
         if dev_reg is not None and info.integration == "broadlink" and mac:
             try:
-                device = dev_reg.async_get_device(
-                    connections={(dr.CONNECTION_NETWORK_MAC, mac)}
+                # Scoped to the Broadlink entry matched above, because
+                # that is the entry the blaster belongs to and a
+                # connection is unique within one entry. When no entry
+                # matched -- a store file whose integration is gone --
+                # the helper searches every entry instead, which is the
+                # breadth this lookup always had.
+                device = device_by_connection(
+                    dev_reg,
+                    (dr.CONNECTION_NETWORK_MAC, mac),
+                    store_entry_id,
                 )
             except Exception:
                 device = None
@@ -511,4 +539,7 @@ async def run_store_pluck(
         friendly_name=info.friendly_name,
         kind=provider.kind,
         codes=codes,
+        # The provider's own shape, which decides what a new remote is
+        # called: a flat code list is one remote named after the store.
+        shape=provider.shape,
     )

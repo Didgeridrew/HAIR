@@ -42,19 +42,19 @@ from .const import (
     DeviceType,
 )
 from .device_manager import DeviceManager, category_for_command_name
+from .device_registry_compat import device_by_identifier, hair_config_entry_id
 from .frequency_standards import IR_CARRIER_STANDARDS_HZ
 from .identity import (
     SignalIdentity,
     canonical_byte_hash,
     canonical_fingerprint,
 )
-from .models import IRDevice, IRTrigger, TriggerRemote
+from .models import MAX_POWER_SETTLE_S, IRDevice, IRTrigger, TriggerRemote
 from .pronto_validator import validate_pronto
 from .signal_monitor import SignalMonitor
 from .signal_store import SignalStore
 from .trigger_manager import TriggerManager
 from .wig_format import VERDICTS
-from .wig_format import cell_key as _cell_key
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -94,6 +94,7 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_device_matrix_cells)
     websocket_api.async_register_command(hass, ws_device_matrix_send)
     websocket_api.async_register_command(hass, ws_device_matrix_command)
+    websocket_api.async_register_command(hass, ws_device_matrix_thin)
     # The hear side of the same lattice (signpost 4, Track M)
     websocket_api.async_register_command(hass, ws_trigger_remote_matrix_cells)
     websocket_api.async_register_command(hass, ws_trigger_remote_matrix_cell)
@@ -218,7 +219,9 @@ def _ha_device_id(hass: HomeAssistant, device: IRDevice) -> str | None:
     under -- (DOMAIN, device.id), see e.g. switch.py's device_info.
     """
     registry = dr.async_get(hass)
-    ha_device = registry.async_get_device(identifiers={(DOMAIN, device.id)})
+    ha_device = device_by_identifier(
+        registry, (DOMAIN, device.id), hair_config_entry_id(hass)
+    )
     return ha_device.id if ha_device is not None else None
 
 
@@ -233,6 +236,10 @@ def _device_summary(device: IRDevice, hass: HomeAssistant) -> dict[str, Any]:
         "power_sensor_entity_id": device.power_sensor_entity_id,
         "power_off_below_w": device.power_off_below_w,
         "power_on_above_w": device.power_on_above_w,
+        # The stored value, None included: the panel shows the default
+        # for None, and a save of an untouched dialog sends None back
+        # so the device keeps following the default.
+        "power_settle_s": device.power_settle_s,
         "temperature_sensor_entity_id": device.temperature_sensor_entity_id,
         "humidity_sensor_entity_id": device.humidity_sensor_entity_id,
         "command_count": len(device.commands),
@@ -246,6 +253,10 @@ async def _device_full(
     hass: HomeAssistant, device: IRDevice
 ) -> dict[str, Any]:
     full = device.to_dict()
+    # The store record omits an unset settle time (models.py, so the
+    # default stays a default); the panel always gets the key, null
+    # meaning the default, the same as the list summary sends.
+    full["power_settle_s"] = device.power_settle_s
     full["command_count"] = len(device.commands)
     full["ha_device_id"] = _ha_device_id(hass, device)
     # The matrix summary rides the full payload (owner ruling
@@ -660,6 +671,9 @@ async def ws_create_device(
     vol.Optional("power_sensor_entity_id"): vol.Any(str, None),
     vol.Optional("power_off_below_w"): vol.Any(vol.Coerce(float), None),
     vol.Optional("power_on_above_w"): vol.Any(vol.Coerce(float), None),
+    # Range-checked in the handler, with the other power fields, so a
+    # bad value is refused before anything on the device is touched.
+    vol.Optional("power_settle_s"): vol.Any(vol.Coerce(float), None),
     vol.Optional("temperature_sensor_entity_id"): vol.Any(str, None),
     vol.Optional("humidity_sensor_entity_id"): vol.Any(str, None),
 })
@@ -718,6 +732,7 @@ async def ws_update_device(
             "power_sensor_entity_id",
             "power_off_below_w",
             "power_on_above_w",
+            "power_settle_s",
         )
     ):
         new_sensor = msg.get(
@@ -731,9 +746,11 @@ async def ws_update_device(
             )
             return
         if new_sensor is None:
-            # Thresholds without a sensor are meaningless.
+            # Thresholds without a sensor are meaningless, and so is a
+            # settle time: all three clear with the sensor.
             new_off_below = None
             new_on_above = None
+            new_settle = None
         else:
             new_off_below = msg.get(
                 "power_off_below_w", device.power_off_below_w
@@ -741,6 +758,19 @@ async def ws_update_device(
             new_on_above = msg.get(
                 "power_on_above_w", device.power_on_above_w
             )
+            # None is the default (DEFAULT_POWER_SETTLE_S); 0 is no
+            # window at all. The two are different and stay different.
+            new_settle = msg.get("power_settle_s", device.power_settle_s)
+        if new_settle is not None and not (
+            0 <= new_settle <= MAX_POWER_SETTLE_S
+        ):
+            connection.send_error(
+                msg["id"],
+                "invalid_format",
+                "power_settle_s must be from 0 to "
+                f"{MAX_POWER_SETTLE_S:g} seconds",
+            )
+            return
         if (
             new_off_below is not None
             and new_on_above is not None
@@ -755,6 +785,7 @@ async def ws_update_device(
         device.power_sensor_entity_id = new_sensor
         device.power_off_below_w = new_off_below
         device.power_on_above_w = new_on_above
+        device.power_settle_s = new_settle
 
     # Climate room sensors validate together too, same "nothing
     # half-mutated on a rejected request" reasoning as the power
@@ -935,7 +966,14 @@ async def ws_delete_command(
     # that simply stops offering that state.
     cell = _porthole_cell(manager, msg["device_id"], msg["command_id"])
     if cell is not None:
-        await manager.async_delete_cell(msg["device_id"], cell)
+        removed_cell = await manager.async_delete_cell(msg["device_id"], cell)
+        if removed_cell:
+            # AND TELL EVERYTHING THAT HOLDS A COPY (owner bench
+            # 2026-09-22). The manager's own cache is refreshed by the
+            # write, but a live climate entity loaded its matrix once
+            # and would go on offering -- and transmitting -- the cell
+            # this just deleted, until the next restart.
+            _signal_matrix_changed(hass, msg["device_id"])
 
     removed = await manager.async_remove_command(
         msg["device_id"], msg["command_id"]
@@ -2916,18 +2954,35 @@ async def ws_command_update(
     # first: if the cell is gone the row is stale, and updating the
     # command anyway would leave a row claiming bytes no cell carries.
     cell = _porthole_cell(device_manager, msg["device_id"], msg["command_id"])
-    if (
-        cell is not None
-        and msg.get("pronto")
-        and not await device_manager.async_replace_cell(
+    if cell is not None and msg.get("pronto"):
+        from .wig_climate import pronto_text_key
+
+        matrix = await device_manager.async_get_matrix(msg["device_id"])
+        before = next(
+            (
+                lattice_cell.pronto for lattice_cell in (
+                    matrix.cells if matrix is not None else ()
+                )
+                if device_manager._cell_matches(lattice_cell, cell)
+            ),
+            None,
+        )
+        if not await device_manager.async_replace_cell(
             msg["device_id"], cell, msg["pronto"]
-        )
-    ):
-        connection.send_error(
-            msg["id"], "cell_missing",
-            "That cell is no longer in the device's matrix",
-        )
-        return
+        ):
+            connection.send_error(
+                msg["id"], "cell_missing",
+                "That cell is no longer in the device's matrix",
+            )
+            return
+        # A lattice whose bytes changed says so like every other
+        # writer's: the listener's index of this device still records
+        # the old bytes at this cell, and the climate entity still holds
+        # them. The editor sends the Pronto with every save, a rename
+        # included, and an unchanged code is no reason to rebuild an
+        # index, which on a large lattice is many seconds.
+        if pronto_text_key(before) != pronto_text_key(msg["pronto"]):
+            _signal_matrix_changed(hass, msg["device_id"])
 
     stored = _command_by_ids(data, msg["device_id"], msg["command_id"])
     # The one place a saved spacing is checked (GH #151). Refused
@@ -3660,7 +3715,9 @@ def _trigger_drawer_ha_device_id(hass: HomeAssistant) -> str | None:
     from .event import TRIGGER_DEVICE_ID
 
     registry = dr.async_get(hass)
-    ha_device = registry.async_get_device(identifiers={(DOMAIN, TRIGGER_DEVICE_ID)})
+    ha_device = device_by_identifier(
+        registry, (DOMAIN, TRIGGER_DEVICE_ID), hair_config_entry_id(hass)
+    )
     return ha_device.id if ha_device is not None else None
 
 
@@ -3739,7 +3796,9 @@ async def ws_rename_trigger_drawer(
     resync_drawer_name(hass, entry_id, name)
 
     registry = dr.async_get(hass)
-    ha_device = registry.async_get_device(identifiers={(DOMAIN, TRIGGER_DEVICE_ID)})
+    ha_device = device_by_identifier(
+        registry, (DOMAIN, TRIGGER_DEVICE_ID), entry_id
+    )
     if ha_device is not None:
         registry.async_update_device(ha_device.id, name=name)
 
@@ -3775,7 +3834,9 @@ def _trigger_remote_ha_device_id(hass: HomeAssistant, remote_id: str) -> str | N
     id instead of the drawer's fixed identifier.
     """
     registry = dr.async_get(hass)
-    ha_device = registry.async_get_device(identifiers={(DOMAIN, remote_id)})
+    ha_device = device_by_identifier(
+        registry, (DOMAIN, remote_id), hair_config_entry_id(hass)
+    )
     return ha_device.id if ha_device is not None else None
 
 
@@ -4049,7 +4110,9 @@ async def ws_rename_trigger_remote(
     resync_remote_name(hass, entry_id, remote.id, name)
 
     registry = dr.async_get(hass)
-    ha_device = registry.async_get_device(identifiers={(DOMAIN, remote.id)})
+    ha_device = device_by_identifier(
+        registry, (DOMAIN, remote.id), entry_id
+    )
     if ha_device is not None:
         registry.async_update_device(ha_device.id, name=name)
 
@@ -4102,7 +4165,9 @@ async def ws_set_trigger_remote_receiver_scope(
     await store.async_save()
 
     registry = dr.async_get(hass)
-    ha_device = registry.async_get_device(identifiers={(DOMAIN, remote.id)})
+    ha_device = device_by_identifier(
+        registry, (DOMAIN, remote.id), hair_config_entry_id(hass)
+    )
     connection.send_result(msg["id"], {
         **remote.to_dict(),
         "ha_device_id": ha_device.id if ha_device is not None else None,
@@ -4170,8 +4235,8 @@ async def ws_delete_trigger_remote(
         sync_trigger_entities(hass, entry_id, removed_id=trigger.id)
 
     registry = dr.async_get(hass)
-    ha_device = registry.async_get_device(
-        identifiers={(DOMAIN, msg["remote_id"])}
+    ha_device = device_by_identifier(
+        registry, (DOMAIN, msg["remote_id"]), entry_id
     )
     if ha_device is not None:
         registry.async_remove_device(ha_device.id)
@@ -4224,6 +4289,20 @@ async def ws_pin_trigger_remote_device(
         rederive_remote(store, remote)
         store.update_trigger_remote(remote)
         await store.async_save()
+    # A pinned matrix device's index is what a send reads its merged
+    # groups from, and nothing else builds it for a device pinned while
+    # running whose words match its remote's: without this the dial
+    # rule would stay off for that pairing until a restart. Only for a
+    # matrix remote, the only kind whose sends read it.
+    device = store.get_device(device_id)
+    listener = data.get("matrix_listener")
+    if (
+        listener is not None
+        and remote.climate_matrix
+        and device is not None
+        and device.climate_matrix
+    ):
+        listener.warm_index(device_id)
     connection.send_result(msg["id"], {
         "pinned_device_ids": list(remote.pinned_device_ids),
     })
@@ -5644,11 +5723,15 @@ async def ws_wigs_save(
     # open, so nobody should reach this. It stands behind that for
     # anything calling the endpoint directly, which is exactly why a
     # ruled UI shape does not make a server-side check redundant.
+    #
+    # UNUSUAL ROWS DO NOT COUNT (owner ruled 2026-09-27, GH #177). A
+    # code that only looks unusual is not a claim that it is wrong, so
+    # it stays open and marked but does not hold the signing up.
     if _claiming(attestation) and matrix is not None:
-        from .tangles import FIT_HAS_TANGLES, list_tangles
+        from .tangles import FIT_HAS_TANGLES, blocking_rows, list_tangles
 
         open_rows = await hass.async_add_executor_job(
-            lambda: list_tangles(device, matrix).rows
+            lambda: blocking_rows(list_tangles(device, matrix))
         )
         if open_rows:
             connection.send_error(
@@ -5994,6 +6077,16 @@ async def _do_create(
                 device.source_wig_id,
                 source_wig.supersedes if source_wig is not None else None,
             )
+            # BRAND, MODEL, NOTES AND THE IDENTITY ANCHORS COME ALONG
+            # (owner bench 2026-09-22). The device holds none of them,
+            # so a mint built from the device arrived blank in all four
+            # and a repaired or thinned successor lost the wig's own
+            # brand and model. Only empty fields are filled, so the
+            # dialog's own values, applied above, still win.
+            if source_wig is not None:
+                from .wig_export import carry_descriptive
+
+                carry_descriptive(build.wig, source_wig)
 
         text, result = create_text(build, attestation, key)
         filename = write_wig_text(
@@ -8049,6 +8142,119 @@ async def ws_device_matrix_command(
     connection.send_result(msg["id"], await _device_full(hass, device))
 
 
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): f"{WS_PREFIX}/devices/matrix-thin",
+    vol.Required("device_id"): str,
+    vol.Required("keep_on"): bool,
+    # Validated by the thinning arithmetic, not here, so every refusal
+    # names what it refused and where; a schema miss would only say
+    # "invalid format" about a nested list.
+    vol.Required("lattices"): list,
+    # Accepted by the schema ONLY so the door can refuse them by name.
+    # Off is how the wig turns the unit off and is never the shape's to
+    # decide; without these HA would reject the key with a generic
+    # message that never says why.
+    vol.Optional("off"): object,
+    vol.Optional("keep_off"): object,
+})
+@websocket_api.async_response
+async def ws_device_matrix_thin(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Remove the states a device does not have (thinning-plan.md 2, 3).
+
+    Takes the WHOLE desired shape, never a diff. A lattice absent from
+    ``lattices`` is removed, a mode absent from its lattice is removed,
+    and a kept mode keeps the cells whose values survive on every axis.
+    Every refusal is ``invalid_format`` naming the thing refused
+    (``matrix_thin.ThinRefused``), including the shape that removes
+    nothing, which is decided after the new matrix is built.
+
+    In order: resolve; build the new matrix and its record; write it
+    ONCE and tell everything that holds a copy; remove the portholes of
+    removed cells; write the wig through; answer with the device payload
+    the card reloads from and the write-through's own answer.
+
+    THE WRITE-THROUGH IS THE REPAIRS' ``_write_through``, unchanged: it
+    mints beside the contributor's original the first time and
+    supersedes only files it wrote itself, so the original wig is the
+    undo and nothing here deletes it.
+    """
+    resolved = await _matrix_for_request(hass, connection, msg)
+    if resolved is None:
+        return
+    data, device, matrix = resolved
+    from .matrix_thin import (
+        ThinRefused,
+        porthole_addresses,
+        porthole_record,
+        thin_matrix,
+    )
+
+    for key in ("off", "keep_off"):
+        if key in msg:
+            connection.send_error(
+                msg["id"], "invalid_format",
+                f"off cannot be removed or addressed ({key!r}); it is how "
+                "the wig turns the unit off",
+            )
+            return
+    try:
+        outcome = thin_matrix(matrix, msg["lattices"], msg["keep_on"])
+    except ThinRefused as err:
+        connection.send_error(msg["id"], "invalid_format", str(err))
+        return
+
+    # PORTHOLES GO WITH THEIR CELLS (plan section 3, step 3). A porthole
+    # is a view of a lattice cell; one whose cell is gone is the GH #134
+    # bug, and the exporter would mint it into the successor as a flat
+    # signal. Identified by ``matrix_cell``, never by name. Commands with
+    # no ``matrix_cell`` are real flat signals and are never touched.
+    doomed: list[tuple[Any, dict[str, Any]]] = []
+    for command in device.commands:
+        if not command.matrix_cell:
+            continue
+        cell = porthole_addresses(command.matrix_cell, outcome.removed)
+        if cell is not None:
+            doomed.append(
+                (command, porthole_record(command.id, command.matrix_cell, cell))
+            )
+    outcome.record["portholes_removed"] = [entry for _c, entry in doomed]
+
+    manager: DeviceManager = data["device_manager"]
+    # ONE WRITE, through the manager so its cache holds the new matrix,
+    # then the same signal a repair sends: the climate entity loaded its
+    # matrix once and would otherwise go on offering the removed states.
+    try:
+        await manager.async_write_matrix(device.id, outcome.matrix)
+    except (OSError, ValueError) as err:
+        connection.send_error(msg["id"], "write_failed", str(err))
+        return
+    _signal_matrix_changed(hass, device.id)
+
+    # After the write, not before: a matrix write that failed must not
+    # have cost the device its portholes on the way.
+    for command, _entry in doomed:
+        fingerprint = canonical_fingerprint(
+            command.protocol, command.code, command.raw_timings
+        )
+        await manager.async_remove_command(device.id, command.id)
+        if fingerprint:
+            hass.bus.async_fire(
+                EVENT_SIGNAL_UPDATED, {"signal_fingerprint": fingerprint}
+            )
+
+    device = manager.get_device(device.id) or device
+    connection.send_result(msg["id"], {
+        "thinned": outcome.record,
+        "wig": await _write_through(hass, device),
+        "device": await _device_full(hass, device),
+    })
+
+
 # --- Tangles: the fix flow (device-scoped findings) ---
 
 
@@ -8463,7 +8669,7 @@ async def _write_matrix_and_signal(
     and without the signal the unit would go on receiving the bytes the
     repair replaced.
     """
-    from .matrix_store import SIGNAL_MATRIX_CHANGED, write_matrix
+    from .matrix_store import write_matrix
 
     try:
         await hass.async_add_executor_job(
@@ -8472,14 +8678,38 @@ async def _write_matrix_and_signal(
     except (OSError, ValueError) as err:
         return str(err)
 
+    _signal_matrix_changed(hass, device.id)
+    return None
+
+
+def _signal_matrix_changed(hass: HomeAssistant, device_id: str) -> None:
+    """Tell everything holding a copy of one device's lattice that it
+    changed: the matrix listener's index, and every live climate entity.
+
+    Lifted out of ``_write_matrix_and_signal`` unchanged so the thinning
+    door sends exactly what a repair sends rather than a second copy of
+    it.
+    """
+    from .matrix_store import SIGNAL_MATRIX_CHANGED
+
     data = _get_first_entry_data(hass)
     listener = data.get("matrix_listener") if data else None
     if listener is not None:
         # The lattice CHANGED, so every cached index and reading built
         # from it is answering about a file that no longer exists.
-        listener.invalidate(device.id)
-    async_dispatcher_send(hass, SIGNAL_MATRIX_CHANGED, device.id)
-    return None
+        listener.invalidate(device_id)
+        # And rebuilt now, for a device some matrix remote is pinned
+        # to: its sends read their merged groups from that index, and
+        # nothing else rebuilds it while the remote's words and the
+        # device's agree. Only for such a device, since on a Pi a large
+        # lattice is many seconds of an executor thread.
+        store = data.get("store")
+        if store is not None and any(
+            remote.climate_matrix and device_id in remote.pinned_device_ids
+            for remote in store.get_all_trigger_remotes()
+        ):
+            listener.warm_index(device_id)
+    async_dispatcher_send(hass, SIGNAL_MATRIX_CHANGED, device_id)
 
 
 @websocket_api.require_admin
@@ -8532,14 +8762,17 @@ async def ws_tangle_apply(
         APPLY_DISAGREEMENT_UNDECLARED,
         APPLY_NO_FINDING,
         APPLY_NOT_TESTED,
+        DECLARE_UNREAD,
         build_provenance,
+        declaration_needed,
+        holders_for_target,
         list_tangles,
-        portholes_for,
         pre_read,
         project_device,
         read_lattice,
         rederive_comb_stamps,
         sweep_comb_stamps_if_retired,
+        target_is_gone,
         write_repair,
     )
 
@@ -8574,9 +8807,12 @@ async def ws_tangle_apply(
     row, lattice, verdict = prepared
 
     declared = bool(msg.get("reading_disagreed"))
-    if verdict.matches is False and not declared:
+    needed = declaration_needed(lattice, row.target, verdict.as_dict())
+    if needed is not None and not declared:
         connection.send_error(
             msg["id"], APPLY_DISAGREEMENT_UNDECLARED,
+            "The map does not read these bytes at all; say so to apply "
+            "anyway" if needed == DECLARE_UNREAD else
             "These bytes read as something else; say so to apply anyway",
         )
         return
@@ -8598,20 +8834,25 @@ async def ws_tangle_apply(
 
     manager: DeviceManager = _get_first_entry_data(hass)["device_manager"]
     if row.target.kind == "cell":
-        cell = next(
-            (c for c in matrix.cells if _cell_key(c) == row.target.key), None
+        # ONE RESOLVER FOR EVERY TARGET (owner bench 2026-09-23): a
+        # cell, or the matrix's own Off / On through a PowerHolder.
+        # This door used to search ``matrix.cells`` for the key "off",
+        # find nothing, and answer "That cell is gone" -- which is what
+        # a person capturing a Fujitsu's power code was told.
+        holders = holders_for_target(
+            device, matrix, row.target.kind, row.target.key,
+            row.target.coordinates,
         )
-        if cell is None:
+        if not holders:
             connection.send_error(
-                msg["id"], APPLY_NO_FINDING, "That cell is gone")
+                msg["id"], APPLY_NO_FINDING,
+                target_is_gone(row.target.kind, row.target.key))
             return
-        write_repair(cell, msg["pronto"], provenance)
-        # The porthole is a copy of the cell taken at adopt, and it is
-        # what TEST sends. Leaving it behind would hand somebody a
-        # button that still transmits the code they just repaired.
-        portholes = portholes_for(device, row.target.coordinates)
-        for porthole in portholes:
-            write_repair(porthole, msg["pronto"], provenance)
+        for holder in holders:
+            write_repair(holder, msg["pronto"], provenance)
+        # A cell's portholes are copies taken at adopt, and they are
+        # what TEST sends, so they move with it; a power code has none.
+        portholes = holders[1:]
         failure = await _write_matrix_and_signal(hass, device, matrix)
         if failure is not None:
             connection.send_error(msg["id"], "write_failed", failure)
@@ -8633,7 +8874,8 @@ async def ws_tangle_apply(
         command = device.get_command(row.target.command_id or "")
         if command is None:
             connection.send_error(
-                msg["id"], APPLY_NO_FINDING, "That command is gone")
+                msg["id"], APPLY_NO_FINDING,
+                target_is_gone(row.target.kind, row.target.key))
             return
         write_repair(command, msg["pronto"], provenance)
         attested = await _keep_the_override(
@@ -8678,9 +8920,11 @@ async def ws_tangle_revert(
     from .tangles import (
         APPLY_NOTHING_TO_REVERT,
         TARGET_CELL,
+        is_power_key,
         portholes_for,
         read_repair,
         rederive_comb_stamps,
+        resolve_holder,
         revert_repair,
     )
 
@@ -8688,22 +8932,20 @@ async def ws_tangle_revert(
     manager: DeviceManager = _get_first_entry_data(hass)["device_manager"]
 
     if kind == TARGET_CELL:
-        cell = next(
-            (c for c in (matrix.cells if matrix else []) if _cell_key(c) == key),
-            None,
-        )
-        if cell is None or read_repair(cell) is None:
+        # The same resolver the apply door uses, so an Off that could be
+        # repaired can also be undone (owner bench 2026-09-23).
+        holder = resolve_holder(device, matrix, kind, key)
+        if holder is None or read_repair(holder) is None:
             connection.send_error(
                 msg["id"], APPLY_NOTHING_TO_REVERT,
                 "Nothing was repaired here",
             )
             return
-        coordinates = {
-            "mode": cell.mode, "fan": cell.fan,
-            "swing": cell.swing, "temp": cell.temp,
-        }
-        record = revert_repair(cell)
-        portholes = portholes_for(device, coordinates)
+        portholes = [] if is_power_key(key) else portholes_for(device, {
+            "mode": holder.mode, "fan": holder.fan,
+            "swing": holder.swing, "temp": holder.temp,
+        })
+        record = revert_repair(holder)
         for porthole in portholes:
             revert_repair(porthole)
         # The mark goes back with the bytes: an undo that left the
@@ -8833,9 +9075,10 @@ async def ws_tangle_apply_batch(
         TIER_AIR_TESTED,
         TIER_RULE_DERIVED,
         build_provenance,
+        declaration_needed,
+        holders_for_target,
         list_tangles,
         plan_batch,
-        portholes_for,
         project_device,
         read_lattice,
         rederive_comb_stamps,
@@ -8844,6 +9087,7 @@ async def ws_tangle_apply_batch(
         restore_holder,
         sample_covers_modes,
         sweep_comb_stamps_if_retired,
+        target_is_gone,
         write_repair,
     )
 
@@ -8886,12 +9130,14 @@ async def ws_tangle_apply_batch(
     declared = bool(msg.get("reading_disagreed"))
     disagreeing = [
         member for member, candidate in plan.candidates.items()
-        if candidate["verdict"]["matches"] is False
+        if declaration_needed(
+            lattice, rows[member].target, candidate["verdict"]) is not None
     ]
     if disagreeing and not declared:
         connection.send_error(
             msg["id"], APPLY_DISAGREEMENT_UNDECLARED,
-            "Some of these read as something else; say so to apply anyway",
+            "Some of these read as something else, or the map does not "
+            "read them at all; say so to apply anyway",
         )
         return
 
@@ -8900,7 +9146,6 @@ async def ws_tangle_apply_batch(
         key: max(0, int(value or 0))
         for key, value in (msg.get("sends_fired") or {}).items()
     }
-    cells = {_cell_key(c): c for c in (matrix.cells if matrix else [])}
     snapshot: list[tuple[Any, str, dict[str, Any]]] = []
     writes: list[tuple[Any, str, dict[str, Any]]] = []
     for member in members:
@@ -8926,20 +9171,22 @@ async def ws_tangle_apply_batch(
             disagreed=(candidate["verdict"] if declared
                        and member in disagreeing else None),
         )
-        if row.target.kind == TARGET_CELL:
-            holder = cells.get(row.target.key)
-            if holder is None:
-                connection.send_error(
-                    msg["id"], BATCH_EMPTY, "A cell in this run is gone")
-                return
-            holders = [holder, *portholes_for(device, row.target.coordinates)]
-        else:
-            holder = device.get_command(row.target.command_id or "")
-            if holder is None:
-                connection.send_error(
-                    msg["id"], BATCH_EMPTY, "A command in this run is gone")
-                return
-            holders = [holder]
+        # THE SHARED RESOLVER, so a run that includes a power row
+        # writes the matrix's Off or On rather than hunting for a cell
+        # by that name (owner bench 2026-09-23).
+        key = (
+            row.target.key if row.target.kind == TARGET_CELL
+            else (row.target.command_id or "")
+        )
+        holders = holders_for_target(
+            device, matrix, row.target.kind, key, row.target.coordinates,
+        )
+        if not holders:
+            connection.send_error(
+                msg["id"], BATCH_EMPTY,
+                f"{target_is_gone(row.target.kind, key)}, so this run "
+                "cannot be applied")
+            return
         for each in holders:
             snapshot.append(
                 (each, repair_bytes(each), dict(repair_extras(each))))
@@ -8995,13 +9242,16 @@ async def ws_tangle_revert_run(
     from .tangles import (
         APPLY_NOTHING_TO_REVERT,
         read_repair,
+        record_holders,
         rederive_comb_stamps,
         revert_repair,
     )
 
+    # Cells, commands AND the two power codes: a power repair's record
+    # lives on the matrix, so a run that touched one was invisible to
+    # this undo before (owner bench 2026-09-23).
     holders = [
-        holder for holder in
-        [*(matrix.cells if matrix else []), *device.commands]
+        holder for holder in record_holders(device, matrix)
         if (read_repair(holder) or {}).get("run") == msg["run"]
     ]
     if not holders:

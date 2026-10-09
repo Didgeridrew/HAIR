@@ -8,13 +8,14 @@ from pathlib import Path
 from homeassistant.components import frontend, panel_custom
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE, Platform
+from homeassistant.core import Event, HomeAssistant
 
 from .capture_orchestrator import CaptureOrchestrator
 from .const import DOMAIN, PANEL_ICON, PANEL_TITLE, PANEL_URL, PLUCKABLE_DIRNAME
 from .device_manager import DeviceManager, prime_localized_auto_map
-from .entity_factory import EntityFactory
+from .entity_factory import EntityFactory, reconcile_orphan_entities
+from .field_readers import prime_field_maps
 from .matrix_listener import MatrixListener
 from .pluckable_loader import load_pluckables
 from .power_monitor import PowerMonitor
@@ -69,6 +70,11 @@ async def async_setup_entry(
     # One-time migration: fix legacy entry title.
     if entry.title != "HAIR":
         hass.config_entries.async_update_entry(entry, title="HAIR")
+
+    # The field-map library, off the loop and before anything can want
+    # it. Identity reads the maps now, and loading a store backfills
+    # identities, so this has to come first (VM999 bench 2026-09-29).
+    await hass.async_add_executor_job(prime_field_maps)
 
     store = HAIRStore(hass)
     await store.async_load()
@@ -149,9 +155,65 @@ async def async_setup_entry(
 
     entry.async_on_unload(register_platform_cache_invalidation(hass))
 
+    # THE SNIFFER CATALOG HAS TO REACH DISK WHEN HOME ASSISTANT STOPS
+    # (WigFactory bench 2026-09-23: four sends made in the seconds
+    # before a graceful restart were gone afterwards; the two after it
+    # were there).
+    #
+    # Captures are written on a debounce with a ceiling, so the file is
+    # routinely up to SIGNAL_SAVE_DEBOUNCE_S behind memory, and a
+    # ``loop.call_later`` handle is worth nothing once the loop stops.
+    # The unload path already closes its own half: async_unload_entry
+    # stops the monitor, whose async_stop flushes the store. But A
+    # GRACEFUL SHUTDOWN DOES NOT UNLOAD CONFIG ENTRIES, so on a restart
+    # none of that runs. The two hooks cover disjoint cases -- unload
+    # for reload and removal, this one for stop and restart -- and
+    # neither is redundant.
+    #
+    # FINAL_WRITE, not STOP: STOP is the stage where integrations are
+    # still being torn down and may still write, and FINAL_WRITE is the
+    # one core reserves for persisting what they leave behind. Core
+    # fires it and then blocks on the pending tasks, so an async
+    # listener is awaited rather than raced. It is the same event
+    # core's own ``Store.async_delay_save`` registers for.
+    #
+    # Registered under ``async_on_unload`` so a reload cannot leave a
+    # listener pointing at the previous entry's store.
+
+    async def _flush_signal_store(_event: Event) -> None:
+        """Write the catalog if the debounce has not yet caught up."""
+        if await signal_store.async_flush():
+            _LOGGER.debug("Sniffer catalog flushed at final write")
+
+    entry.async_on_unload(
+        hass.bus.async_listen(
+            EVENT_HOMEASSISTANT_FINAL_WRITE, _flush_signal_store
+        )
+    )
+
     async_register_websocket_commands(hass)
 
     await _async_register_panel(hass, entry)
+
+    # ORPHANED ENTITY ROWS, CLEARED BEFORE THE PLATFORMS COME UP
+    # (GH #186, reported by @kilrah). Until 0.17.1 a deleted command,
+    # trigger or device left its entity's registry row behind, so HA
+    # went on offering the entity in pickers, attached to a device it no
+    # longer belonged to. This clears what earlier versions left, and it
+    # runs here for two reasons: the store is loaded, so it knows what
+    # is still alive, and no platform has registered an entity yet, so
+    # nothing live can be mistaken for an orphan. It declines to act on
+    # a store that did not load normally -- see its own docstring.
+    orphans = reconcile_orphan_entities(hass, entry.entry_id, store)
+    if orphans.skipped:
+        _LOGGER.warning(
+            "Skipped the entity cleanup: %s", orphans.skipped
+        )
+    elif orphans.removed:
+        _LOGGER.info(
+            "Removed %d entity registry row(s) left by deleted commands, "
+            "triggers or devices", orphans.removed,
+        )
 
     await hass.config_entries.async_forward_entry_setups(
         entry, PLATFORMS_LIST
@@ -277,6 +339,19 @@ async def async_unload_entry(
         tm: TriggerManager | None = data.get("trigger_manager")
         if tm is not None:
             tm.shutdown()
+
+        # Belt and braces on the unload half. ``monitor.async_stop``
+        # above already flushes the catalog (it ends in the store's own
+        # ``async_shutdown``), and that is the path a normal unload
+        # takes. This covers the one case that path does not: an entry
+        # torn down without a monitor in its data, which a setup that
+        # failed part way through leaves behind. Ordered AFTER the
+        # monitor stop so nothing can schedule a save into the gap, and
+        # a no-op on a clean store, so the usual unload pays nothing
+        # for it.
+        sig_store: SignalStore | None = data.get("signal_store")
+        if sig_store is not None:
+            await sig_store.async_flush()
 
 
     if not any(

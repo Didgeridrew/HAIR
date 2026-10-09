@@ -59,12 +59,23 @@ _stub("homeassistant")
 
 
 class _State:
-    """Minimal stub of homeassistant.core.State (power_monitor.py)."""
+    """Minimal stub of homeassistant.core.State (power_monitor.py).
 
-    def __init__(self, entity_id="", state="unknown", attributes=None):
+    ``last_reported`` defaults to the moment the state is made, as Home
+    Assistant's does; the settle window's handback compares it with the
+    send.
+    """
+
+    def __init__(
+        self, entity_id="", state="unknown", attributes=None,
+        last_reported=None,
+    ):
         self.entity_id = entity_id
         self.state = state
         self.attributes = attributes or {}
+        self.last_reported = last_reported or datetime.datetime.now(
+            datetime.UTC
+        )
 
 
 _stub("homeassistant.core", {
@@ -108,6 +119,12 @@ _stub("homeassistant.const", {
     "UnitOfPower": _UnitOfPower,
     "EVENT_HOMEASSISTANT_STARTED": "homeassistant_started",
     "EVENT_HOMEASSISTANT_STOP": "homeassistant_stop",
+    # Shutdown stage 3, the one HA reserves for persisting what stage 2
+    # left behind. __init__ flushes the Sniffer catalog on it, because a
+    # graceful restart never unloads a config entry and the catalog's
+    # debounce timer dies with the loop. Values verified against core's
+    # own const.py, not guessed.
+    "EVENT_HOMEASSISTANT_FINAL_WRITE": "homeassistant_final_write",
     "STATE_UNAVAILABLE": "unavailable",
     "STATE_UNKNOWN": "unknown",
     "STATE_ON": "on",
@@ -501,6 +518,9 @@ _mock_entity_registry = MagicMock()
 _stub("homeassistant.helpers.entity_registry", {
     "async_get": MagicMock(return_value=_mock_entity_registry),
     "async_entries_for_device": MagicMock(return_value=[]),
+    # The setup-time orphan sweep (GH #186) walks this entry's rows.
+    # Empty by default: a test that cares supplies its own registry.
+    "async_entries_for_config_entry": MagicMock(return_value=[]),
     "RegistryEntry": MagicMock,
 })
 

@@ -42,7 +42,7 @@ SCHEMA.md` (v0.2) and the three derivation reports beside it.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -184,20 +184,38 @@ class FieldMap:
     """One protocol family: how to read its frames and what they mean."""
 
     protocol_id: str
-    #: A content tag for the map itself, so anything that recorded
-    #: "this map justified that write" can tell later whether the map
-    #: it trusted is still the map on disk. Derived from the document
-    #: rather than declared in it, because a hand-maintained version
-    #: number is exactly the field that does not get bumped.
+    #: A content tag for what the map READS AND JUDGES, so anything that
+    #: recorded "this map justified that write" can tell later whether
+    #: the map it trusted still reads the same way. Derived rather than
+    #: declared, because a hand-maintained version number is exactly the
+    #: field that does not get bumped. Derived from the parsed map, not
+    #: the document: an edit to a note, an agreement figure or the
+    #: schema_version line changes nothing a reading depends on, and a
+    #: version that moved on those edits would send every answered comb
+    #: finding for the family back to its owner. See ``_map_version``.
     version: str
     frame_layout: list[int]
     payload_frame: int
+    #: Every frame that carries a setting, ``payload_frame`` first. A map
+    #: that says nothing gets ``[payload_frame]``, which is what every
+    #: consumer assumed before the key existed. Read THIS rather than
+    #: ``payload_frame`` when the question is "which bytes decide what
+    #: this press does": ``payload_frame`` is the primary block only, and
+    #: TCL112 keeps a quiet flag outside it.
+    setting_frames: list[int]
     bit_order: str
     bits_tolerance: int
     identity_bytes: list[tuple[int, int, int]]
     timing: FrameTiming
     fields: list[FieldSpec]
     integrity: list[IntegrityRule]
+    #: Schema v0.6. Frame 0 is a leader that a code may leave out. When it
+    #: is missing the frames that did arrive are laid on the layout from
+    #: frame 1, so every index a map states -- fields, identity bytes,
+    #: rules, ``payload_frame``, ``setting_frames`` -- names the same frame
+    #: whether or not the leader was sent. See ``aligned_frames``. The
+    #: parser only sets it on a map whose frame 0 carries nothing it reads.
+    optional_leader: bool = False
 
     def field_named(self, name: str) -> FieldSpec | None:
         for spec in self.fields:
@@ -224,6 +242,12 @@ class FieldMap:
         frame carries everything the family transmits.
         """
         if len(self.frame_layout) < 2 or len(set(self.frame_layout)) != 1:
+            return False
+        if len(self.setting_frames) > 1:
+            # Settings in two frames and "one payload, repeated" are
+            # contradictory claims. A map making both is wrong somewhere,
+            # and the safe reading of a contradiction is the one that
+            # does not licence dropping a frame.
             return False
         others = set(range(len(self.frame_layout))) - {self.payload_frame}
         declared = {
@@ -340,17 +364,172 @@ def _rule(raw: dict[str, Any]) -> IntegrityRule | None:
     )
 
 
-def _map_version(raw: dict[str, Any]) -> str:
-    """A short content digest of one map document."""
+#: The parts of a parsed map that the version deliberately does NOT
+#: cover, named so the drift test can tell a deliberate omission from a
+#: forgotten one. An integrity rule's description is carried for people
+#: and never consulted by a check.
+_VERSION_EXCLUDED = {
+    "FieldMap": frozenset({"version"}),
+    "IntegrityRule": frozenset({"description"}),
+}
+
+
+def _canonical(value: Any) -> Any:
+    """``value`` as a structure whose JSON text depends only on content.
+
+    Dict keys are sorted, so the order a map author happened to write
+    them in does not move the version. They are sorted on (type name,
+    text) rather than on the key itself, because a map's vocabulary
+    legitimately mixes key types -- YAML reads ``on:`` as the boolean
+    True beside ``"cool"`` -- and comparing those directly raises. The
+    type name also keeps True and "True" apart. Lists keep their order,
+    since in a map order can carry meaning (``setting_frames`` puts the
+    payload frame first). A converted dict becomes a one-key object, and
+    lists never do, so the two cannot collide.
+    """
+    if is_dataclass(value) and not isinstance(value, type):
+        value = asdict(value)
+    if isinstance(value, dict):
+        pairs = [
+            [[type(key).__name__, str(key)], _canonical(item)]
+            for key, item in value.items()
+        ]
+        pairs.sort(key=lambda pair: pair[0])
+        return {"d": pairs}
+    if isinstance(value, list | tuple):
+        return [_canonical(item) for item in value]
+    return value
+
+
+def _map_version(
+    *,
+    protocol_id: str,
+    frame_layout: list[int],
+    payload_frame: int,
+    setting_frames: list[int],
+    bit_order: str,
+    bits_tolerance: int,
+    identity: list[tuple[int, int, int]],
+    timing: FrameTiming,
+    fields: list[FieldSpec],
+    rules: list[IntegrityRule],
+    optional_leader: bool = False,
+) -> str:
+    """A short digest of what this map reads and judges, and nothing else.
+
+    Taken over the PARSED map, so it covers exactly what the reader
+    holds: the frame shape and timing alphabet, the identity bytes, each
+    field's location, encoding, parameters (the operative vocabulary
+    lives there), applicability, mode traits, coordinate and confidence,
+    and each rule's type, parameters and confidence. Everything the
+    parser never keeps is out by construction: ``schema_version``,
+    aliases, ``status``, derivation, agreement blocks, notes, open
+    questions, vocabulary notes, prose, ``verified_on``, synthesis, the
+    human copy of each field's vocabulary beside ``encoding_ref``, and
+    the pre-v0.2 frame keys (``header_us``, ``bit0_us`` and so on) that
+    the timing block superseded.
+
+    Stored answers to comb findings are keyed on this value
+    (``tangles.attestation_key``), so it has one job: move when a
+    reading could have changed and at no other time.
+
+    ``optional_leader`` enters the digest only when it is set. A map that
+    does not declare it reads exactly as it did before the key existed,
+    so its version must not move for a key it does not use; a map that
+    declares it reads codes it used to refuse, so its version must.
+    """
     import hashlib
     import json
 
-    # Document order, not sorted keys: a map's vocabulary legitimately
-    # mixes key types (YAML reads `on:` as the boolean True beside
-    # `"cool"`), and sorting those against each other raises. Order is
-    # stable for a given file, which is all a content tag needs.
-    canonical = json.dumps(raw, default=str)
+    projection = {
+        "protocol_id": protocol_id,
+        "frame_layout": list(frame_layout),
+        "payload_frame": payload_frame,
+        "setting_frames": list(setting_frames),
+        "bit_order": bit_order,
+        "bits_tolerance": bits_tolerance,
+        "identity_bytes": [list(entry) for entry in identity],
+        "timing": timing,
+        "fields": list(fields),
+        "integrity": [
+            {
+                key: item for key, item in asdict(rule).items()
+                if key not in _VERSION_EXCLUDED["IntegrityRule"]
+            }
+            for rule in rules
+        ],
+    }
+    if optional_leader:
+        projection["optional_leader"] = True
+    canonical = json.dumps(
+        _canonical(projection), default=str, separators=(",", ":")
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _setting_frames(
+    declared: Any, payload_frame: int, frame_count: int
+) -> list[int]:
+    """The declared setting frames, normalized so consumers can trust them.
+
+    The invariants a consumer relies on are established HERE rather than
+    assumed: the payload frame is present and first, every index names a
+    real frame, and nothing repeats. A map that declares the key badly is
+    normalized rather than rejected, because the loader's contract is that
+    a bad map is skipped or salvaged and never raises mid-comb. Keeping
+    the DOCUMENTS honest is a separate job, done by the schema test, which
+    reads the YAML rather than the parsed object for exactly that reason.
+    """
+    out = [payload_frame]
+    if isinstance(declared, list | tuple):
+        for entry in declared:
+            try:
+                index = int(entry)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < frame_count and index not in out:
+                out.append(index)
+    return out
+
+
+def _optional_leader(
+    declared: Any,
+    frame_layout: list[int],
+    payload_frame: int,
+    setting_frames: list[int],
+    identity: list[tuple[int, int, int]],
+    fields: list[FieldSpec],
+    rules: list[IntegrityRule],
+) -> bool:
+    """Is frame 0 a leader this map lets a code leave out?
+
+    Only ``true`` declares it, and only a frame 0 that is shorter than a
+    byte and that nothing reads can be one. A leader that is sometimes
+    absent cannot carry the payload, a setting, an identity byte, a field
+    or a rule's input: on the codes that leave it out, whatever the map
+    read there would be read from nothing. A document that declares the
+    key on any other frame 0 is not rejected -- the loader salvages
+    rather than raises -- it simply does not get the key, and the schema
+    test fails the document itself.
+    """
+    if declared is not True or len(frame_layout) < 2:
+        return False
+    if frame_layout[0] >= 8:
+        return False
+    if payload_frame == 0 or 0 in setting_frames:
+        return False
+    if any(frame_index == 0 for frame_index, _byte, _value in identity):
+        return False
+    if any(spec.frame == 0 for spec in fields):
+        return False
+    for rule in rules:
+        params = rule.params or {}
+        if int(params.get("frame", 0) or 0) == 0:
+            return False
+        if rule.type == RULE_FRAME_REPEAT \
+                and int(params.get("equals", 0) or 0) == 0:
+            return False
+    return True
 
 
 def parse_map(raw: dict[str, Any]) -> FieldMap | None:
@@ -383,17 +562,42 @@ def parse_map(raw: dict[str, Any]) -> FieldMap | None:
         rule for rule in (_rule(r) for r in raw.get("integrity") or [])
         if rule is not None
     ]
+    frame_layout = [int(bits) for bits in layout]
+    payload_frame = int(frame.get("payload_frame", 0) or 0)
+    setting_frames = _setting_frames(
+        frame.get("setting_frames"), payload_frame, len(frame_layout)
+    )
+    bit_order = str(frame.get("bit_order", "msb_first"))
+    bits_tolerance = int(frame.get("bits_tolerance", 1) or 0)
+    optional_leader = _optional_leader(
+        frame.get("optional_leader"), frame_layout, payload_frame,
+        setting_frames, identity, fields, rules,
+    )
     return FieldMap(
         protocol_id=protocol_id,
-        version=_map_version(raw),
-        frame_layout=[int(bits) for bits in layout],
-        payload_frame=int(frame.get("payload_frame", 0) or 0),
-        bit_order=str(frame.get("bit_order", "msb_first")),
-        bits_tolerance=int(frame.get("bits_tolerance", 1) or 0),
+        version=_map_version(
+            protocol_id=protocol_id,
+            frame_layout=frame_layout,
+            payload_frame=payload_frame,
+            setting_frames=setting_frames,
+            bit_order=bit_order,
+            bits_tolerance=bits_tolerance,
+            identity=identity,
+            timing=timing,
+            fields=fields,
+            rules=rules,
+            optional_leader=optional_leader,
+        ),
+        frame_layout=frame_layout,
+        payload_frame=payload_frame,
+        setting_frames=setting_frames,
+        bit_order=bit_order,
+        bits_tolerance=bits_tolerance,
         identity_bytes=identity,
         timing=timing,
         fields=fields,
         integrity=rules,
+        optional_leader=optional_leader,
     )
 
 
@@ -441,6 +645,26 @@ def reset_library() -> None:
     _LIBRARY = None
 
 
+def prime_field_maps() -> None:
+    """Fill the library cache. Blocking file I/O, so never on the loop.
+
+    Called once from ``async_setup_entry`` through the executor, BEFORE
+    either store loads. Since setting-frame identity (#187) every
+    identity computed reads this library, and the first read globs the
+    directory and opens each YAML in it. ``_backfill_canonical_identity``
+    runs inside ``store.async_load`` on every start, so without this warm
+    the first stored command HA touches costs three blocking calls on
+    the event loop, and HA says so: scandir, read_text and open, logged
+    as "Detected blocking call" (VM999 bench 2026-09-29).
+
+    One warm covers the process. The capture path and trigger matching
+    reach the same cache and are wired later in the same function, so
+    they find it filled; ``field_map_digest`` does its own reading but
+    is only ever called from the executor.
+    """
+    library()
+
+
 # ---------------------------------------------------------------------------
 # Pronto to pulses, without the transmit side
 # ---------------------------------------------------------------------------
@@ -484,6 +708,30 @@ def read_frames(
     return frames, unreadable
 
 
+@dataclass(frozen=True)
+class WalkRefusal:
+    """Where and why the walk refused a train. Reading only.
+
+    ``pair`` is the pulse pair's index in the trailing-zero-stripped
+    train; ``frame`` the number of frames the walk had closed before it
+    (empty ones included); ``bit`` the bits of the open frame already
+    read. ``window`` is ``"unit"`` when the half of the pair that does
+    not carry the bit fell outside ``timing.unit``, and ``"carrier"``
+    when the half that does fell outside both ``zero`` and ``one``.
+
+    The walk has no header rule of its own to refuse at: a pair outside
+    the header windows is tested as a bit, so a header the map does not
+    accept surfaces here as ``bit == 0`` with the pair's own values.
+    """
+
+    pair: int
+    frame: int
+    bit: int
+    window: str
+    mark_us: int
+    space_us: int
+
+
 def read_frames_positioned(
     timing: FrameTiming, timings: list[int]
 ) -> tuple[list[list[int]], list[list[int]], bool]:
@@ -500,9 +748,28 @@ def read_frames_positioned(
     asserted by test. Whoever builds something with these positions
     does it somewhere else.
 
-    ``read_frames`` is this function with the positions dropped, so
-    there is one walk and it cannot drift from itself.
+    ``read_frames`` is this function with the positions dropped, and
+    ``walk_refusal`` is this walk's reason for refusing, so there is one
+    walk and it cannot drift from itself.
     """
+    frames, places, refused = _walk(timing, timings)
+    if refused is not None:
+        return [], [], True
+    return frames, places, False
+
+
+def walk_refusal(
+    timing: FrameTiming, timings: list[int]
+) -> WalkRefusal | None:
+    """Why ``read_frames_positioned`` refuses this train, or None when it
+    reads it. The same walk, so the two cannot disagree."""
+    return _walk(timing, timings)[2]
+
+
+def _walk(
+    timing: FrameTiming, timings: list[int]
+) -> tuple[list[list[int]], list[list[int]], WalkRefusal | None]:
+    """The walk itself: (frames, positions, None), or ([], [], why)."""
     # A zero at the end of the train is Pronto saying "nothing more", not
     # a pulse of no length. Leaving it in makes the last pair of every
     # code that carries one fall outside every window, which would fail
@@ -532,7 +799,9 @@ def read_frames_positioned(
             where = []
             continue
         if not timing.unit.holds(other):
-            return [], [], True
+            return [], [], WalkRefusal(
+                index, len(frames), len(bits), "unit", mark_us, space_us
+            )
         if timing.zero.holds(carrier):
             bits.append(0)
             where.append(index)
@@ -543,7 +812,10 @@ def read_frames_positioned(
             # Outside every window the map states. Guessing here would
             # be a reading nobody can check, and skipping would shift
             # every bit after it.
-            return [], [], True
+            return [], [], WalkRefusal(
+                index, len(frames), len(bits), "carrier", mark_us,
+                space_us,
+            )
     if bits:
         frames.append(bits)
         places.append(where)
@@ -551,7 +823,7 @@ def read_frames_positioned(
     return (
         [frames[i] for i in kept],
         [places[i] for i in kept],
-        False,
+        None,
     )
 
 
@@ -574,14 +846,140 @@ def bits_to_bytes(bits: list[int], bit_order: str) -> tuple[int, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _matches_layout(field_map: FieldMap, frames: list[list[int]]) -> bool:
-    if len(frames) != len(field_map.frame_layout):
+def _widths_fit(
+    frames: list[list[int]], layout: list[int], tolerance: int
+) -> bool:
+    if len(frames) != len(layout):
         return False
-    tolerance = field_map.bits_tolerance
     return all(
         abs(len(frame) - expected) <= tolerance
-        for frame, expected in zip(frames, field_map.frame_layout, strict=True)
+        for frame, expected in zip(frames, layout, strict=True)
     )
+
+
+def _leader_missing(
+    field_map: FieldMap, frames: list[list[int]]
+) -> bool | None:
+    """False: the frames fit the layout as they are. True: they fit it
+    with the optional leader left out. None: they do not fit it.
+
+    The whole layout is tried first, so a code that carries its leader
+    is always read with it; the short form is only ever a second chance,
+    and only for a map that declared it.
+    """
+    layout = field_map.frame_layout
+    tolerance = field_map.bits_tolerance
+    if _widths_fit(frames, layout, tolerance):
+        return False
+    if field_map.optional_leader and _widths_fit(frames, layout[1:], tolerance):
+        return True
+    return None
+
+
+def aligned_frames(
+    field_map: FieldMap, frames: list[list[int]]
+) -> list[list[int]] | None:
+    """The frames laid on the map's layout, or None when they do not fit.
+
+    For every map but one that declares ``optional_leader`` this is the
+    frames unchanged or None, exactly the old layout test. For a code
+    that left its optional leader out, an EMPTY frame 0 stands in for it,
+    so frame ``n`` of the map is element ``n`` of the result whether or
+    not the leader was sent, and nothing downstream renumbers. The empty
+    frame carries no bytes, so any read of it is None, never a value.
+    """
+    missing = _leader_missing(field_map, frames)
+    if missing is None:
+        return None
+    return [[], *frames] if missing else list(frames)
+
+
+def aligned_positioned(
+    field_map: FieldMap,
+    frames: list[list[int]],
+    places: list[list[int]],
+) -> tuple[list[list[int]], list[list[int]]] | None:
+    """``aligned_frames`` for a caller that also holds the pulse positions
+    ``read_frames_positioned`` reported. The stand-in leader has none."""
+    missing = _leader_missing(field_map, frames)
+    if missing is None:
+        return None
+    if missing:
+        return [[], *frames], [[], *places]
+    return list(frames), list(places)
+
+
+def _matches_layout(field_map: FieldMap, frames: list[list[int]]) -> bool:
+    return _leader_missing(field_map, frames) is not None
+
+
+def optional_leader_pairs(pronto: str) -> int | None:
+    """Where this code stands on an optional leader.
+
+    None when no map that declares ``optional_leader`` reads the code.
+    Otherwise the number of leading pulse pairs that ARE the leader: 0
+    when the code left it out, and when it is there, its bits plus the
+    pair whose mark closes it and whose space is the gap after it.
+
+    A caller comparing the SHAPES of codes (the comb's frame-shape check)
+    uses both answers: whether its population mixes the two forms, and
+    how many pairs to set aside on the codes that carry the leader.
+
+    Reading only. Nothing here builds or changes a code.
+    """
+    optional = [m for m in library() if m.optional_leader]
+    if not optional:
+        return None
+    timings = pronto_microseconds(pronto)
+    if not timings:
+        return None
+    for field_map in optional:
+        frames, places, failed = read_frames_positioned(
+            field_map.timing, timings
+        )
+        if failed:
+            continue
+        laid = aligned_positioned(field_map, frames, places)
+        if laid is None:
+            continue
+        frames, places = laid
+        decoded = [bits_to_bytes(f, field_map.bit_order) for f in frames]
+        if not _matches_identity(field_map, decoded):
+            continue
+        leader = places[0]
+        if not leader:
+            return 0
+        if leader[0] == 1:
+            # Some renderings open the leader with a header pair. It
+            # belongs to the leader, and it is the only thing that may
+            # stand in front of it.
+            mark, space = abs(timings[0]), abs(timings[1])
+            if not (field_map.timing.header_mark.holds(mark)
+                    and field_map.timing.header_space.holds(space)):
+                return None
+        elif leader[0] != 0:
+            # Something else precedes the leader. Not a shape this can
+            # account for, so it says nothing rather than guess.
+            return None
+        return leader[-1] + 2
+    return None
+    timings = pronto_microseconds(pronto)
+    if not timings:
+        return 0
+    for field_map in optional:
+        frames, places, failed = read_frames_positioned(
+            field_map.timing, timings
+        )
+        if failed or _leader_missing(field_map, frames) is not False:
+            continue
+        decoded = [bits_to_bytes(f, field_map.bit_order) for f in frames]
+        if not _matches_identity(field_map, decoded):
+            continue
+        leader = places[0]
+        if not leader or leader[0] != 0:
+            continue
+        return leader[-1] + 2
+    return 0
 
 
 def _matches_identity(
@@ -606,16 +1004,19 @@ def _matches_repeat(field_map: FieldMap, frames: list[list[int]]) -> bool:
     """A capture carrying fewer frames than the map declares.
 
     Only for a map that declares identical repeats, and only when the
-    frames present are the declared width and the payload index is one
+    frames present are the declared width and EVERY setting frame is one
     of them. Every other short capture stays unidentified: losing a
-    frame that carries something of its own loses the code.
+    frame that carries something of its own loses the code. The test is
+    on ``setting_frames`` rather than on ``payload_frame`` because a
+    family can keep a setting outside its primary block, and a capture
+    missing that frame is missing part of the press.
     """
     declared = len(field_map.frame_layout)
     if not field_map.repeats_identically:
         return False
     if not frames or len(frames) >= declared:
         return False
-    if field_map.payload_frame >= len(frames):
+    if max(field_map.setting_frames) >= len(frames):
         return False
     width = field_map.frame_layout[0]
     return all(
@@ -684,10 +1085,11 @@ def read_code(
             unreadable = True
             continue
         split.append((field_map, frames))
-        if not _matches_layout(field_map, frames):
+        laid = aligned_frames(field_map, frames)
+        if laid is None:
             continue
         decoded = [
-            bits_to_bytes(frame, field_map.bit_order) for frame in frames
+            bits_to_bytes(frame, field_map.bit_order) for frame in laid
         ]
         if not _matches_identity(field_map, decoded):
             continue
@@ -793,7 +1195,40 @@ def expected_value(spec: FieldSpec, coordinate: Any) -> int | None:
     encoding the map did not state. Every None is coverage, never a
     finding, because a check nobody can compute is not a check that
     passed (coding plan: partial maps are legal and useful).
+
+    A value the field's bits cannot carry is None too, whatever the
+    encoding: a Fahrenheit label on a Celsius field computes to a
+    number no nibble holds, and a comparison against it fails on every
+    code there is. Checked once, here, at the one exit, so an encoding
+    added later is covered without being named.
     """
+    value = _computed_value(spec, coordinate)
+    if value is None or not fits(spec, value):
+        return None
+    return value
+
+
+def fits(spec: FieldSpec, value: int) -> bool:
+    """Can this field's bits carry ``value`` at all?"""
+    try:
+        mask, shift = _bit_selector(spec.bits)
+    except ValueError:
+        return False
+    return value >= 0 and (value << shift) & ~mask == 0
+
+
+def uncomputable_reason(spec: FieldSpec, coordinate: Any) -> str:
+    """Why ``expected_value`` said None for a coordinate it was given:
+    the map computed a value its bits cannot carry, or it computed
+    nothing (a label outside its vocabulary)."""
+    value = _computed_value(spec, coordinate)
+    if value is not None and not fits(spec, value):
+        return OUT_OF_DOMAIN
+    return UNKNOWN_LABEL
+
+
+def _computed_value(spec: FieldSpec, coordinate: Any) -> int | None:
+    """The encoding's arithmetic, before asking whether the bits fit."""
     if spec.encoding is None or coordinate is None:
         return None
     params = spec.params
@@ -882,6 +1317,90 @@ def mode_trait(spec: FieldSpec, mode: str | None, trait: str) -> Any:
     return traits.get(trait)
 
 
+def field_skip_reason(
+    spec: FieldSpec, mode_spec: FieldSpec | None, coordinates: dict[str, Any]
+) -> str | None:
+    """Why the map says this field carries no comparable fact at these
+    coordinates, or None when it does.
+
+    The map's own word only: the field's ``applies_when``, and the mode
+    traits that freeze a temperature (``invariant``) or force a fan.
+    ``mode_spec`` is the map's mode field. Confidence is not asked here,
+    and neither is what a particular wig does (the comb's
+    ``TEMP_FROZEN``): the comb asks both around this call, and the
+    distinctness sweep (``labels_collide``) wants neither.
+
+    A REASON, NOT A YES OR NO. The comb records which of these it was
+    in its coverage, and a yes-or-no version folded all three into
+    "not applicable": four field packs' receipts changed for nothing.
+    """
+    if not applies(spec, coordinates):
+        return NOT_APPLICABLE
+    mode = coordinates.get("mode")
+    if (spec.name == "temperature" and mode_spec is not None
+            and mode_trait(mode_spec, mode, "temp") == "invariant"):
+        return TEMP_INVARIANT
+    if (spec.name == "fan_speed" and mode_spec is not None
+            and mode_trait(mode_spec, mode, "fan") == "forced"):
+        return FAN_FORCED
+    return None
+
+
+#: The four label dimensions the distinctness sweep compares.
+LABEL_DIMENSIONS = ("mode", "fan", "swing", "temp")
+
+
+def labels_collide(
+    field_map: FieldMap, first: dict[str, Any], second: dict[str, Any]
+) -> tuple[str, str | None] | None:
+    """Are two labels that share one read key different settings?
+
+    ``(dimension, field name)`` for the first dimension that makes them
+    so, the field None when no field of the map answers that dimension
+    at all; None when the map says the two labels are one setting.
+
+    THE DISTINCTNESS SWEEP ASKS THE MAP, NOT THE LABELS. A family joins
+    the read-bytes list only when no two of its states share a key, and
+    "two labels" is not "two states": DAIKIN152's dry ignores the fan
+    (``fan_speed`` is forced there) while ``powerful``, ``economy`` and
+    ``sleep`` answer the fan dimension with no ``applies_when`` at all,
+    so a file storing dry / auto and dry / low as one code is the unit
+    ignoring a setting, not a collision. On each dimension the labels
+    differ on, they collide only when some field answering it applies
+    at BOTH labels' coordinates and gives them different expected
+    values, or cannot compute one for either. A dimension no field
+    answers is a collision: the map cannot see it. A dimension whose
+    every field is inapplicable at one of the labels is skipped.
+
+    Provisional fields count, as they do for the key itself (owner
+    ruling 2026-09-30): hiding them hides DAIKIN152's real temperature
+    collisions. The wig-derived frozen-temperature rule stays in the
+    comb: a map trait is the map's word, and a file's behaviour is not.
+    """
+    from .wig_comb import FIELD_COORDINATE  # the comb imports this module
+
+    mode_spec = field_map.field_named("mode")
+    for dimension in LABEL_DIMENSIONS:
+        if first.get(dimension) == second.get(dimension):
+            continue
+        answering = [
+            spec for spec in field_map.fields
+            if (spec.coordinate or FIELD_COORDINATE.get(spec.name))
+            == dimension
+        ]
+        if not answering:
+            return dimension, None
+        for spec in answering:
+            if (field_skip_reason(spec, mode_spec, first) is not None
+                    or field_skip_reason(spec, mode_spec, second) is not None):
+                continue
+            ours = expected_value(spec, first.get(dimension))
+            theirs = expected_value(spec, second.get(dimension))
+            if ours is None or theirs is None or ours != theirs:
+                return dimension, spec.name
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Integrity
 # ---------------------------------------------------------------------------
@@ -925,7 +1444,16 @@ def check_integrity(reading: Reading, rule: IntegrityRule) -> bool | None:
             return None
         modulus = int(params.get("mod", 256) or 256)
         offset = int(params.get("offset", 0) or 0)
-        total = (sum(frame[first:last + 1]) + offset) % modulus
+        # ``scale`` is +1 unless a map says otherwise, so every map
+        # written before this parameter existed computes exactly what it
+        # always did. It exists for the families whose check byte is a
+        # constant MINUS the sum rather than the sum itself: Fujitsu's
+        # 128-bit frame closes with 0xD0 - sum(bytes 8..14), which the
+        # additive form cannot express at any offset. Still no
+        # expression to evaluate, which is the property the closed rule
+        # set exists to keep.
+        scale = int(params.get("scale", 1) or 1)
+        total = (scale * sum(frame[first:last + 1]) + offset) % modulus
         return _masked(frame[target], params) == total % 256
     if rule.type == RULE_NIBBLE_SUM:
         nibbles = params.get("nibbles")
